@@ -1,0 +1,51 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ---- 打包产物（exe 走 Releases，不进仓库）----
+build/
+dist/
+pc/build_new/
+pc/dist_new/
+*.exe
+
+# ---- 运行时 / 用户数据 ----
+remotekey.ini
+logs/
+
+# ---- 逆向原始材料（体积大、含个人设备与抓包，按需自行保留）----
+bugout/
+crops*/
+ref/
+android/
+platform-tools.zip
+bugreport*.zip
+btsnoop*.log
+*.cfa
+*.curf
+*.wav
+
+# ---- 固件构建输出 ----
+firmware/**/build/
+build_s3/
+build_dbg/
+build_syntax/
+build_cmcc/
+.build_s3/
+.build_dbg/
+.build_dbg2/
+*.bin
+*.elf
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.lnk

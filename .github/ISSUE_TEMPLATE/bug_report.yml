@@ -1,0 +1,58 @@
+name: Bug 报告
+description: 有键没反应、连不上、界面异常等
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先看一遍 [docs/troubleshooting.md](../blob/main/docs/troubleshooting.md)，
+        八成的问题（代码 10、Smart App Control、COM 被占用、Win+L 锁屏、TV 键无效）那里都有答案。
+
+  - type: input
+    id: remote
+    attributes:
+      label: 遥控器型号 / 广播名
+      description: 外壳标签上的型号，以及 `SCANDUMP 1` 里看到的 name
+      placeholder: 例如 CMCC_Voice_Remote（XFRCB22 方案）
+    validations:
+      required: true
+
+  - type: textarea
+    id: info
+    attributes:
+      label: 串口 INFO 输出
+      description: 串口发 `INFO`，把返回的那一行贴上来
+      render: text
+      placeholder: OK INFO ver=1 binds=28 learn=0 enabled=1 connected=1 dirty=0 audio=1
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 精确到「按哪个键、期望什么、实际什么」
+      placeholder: |
+        按「设置」键，期望 Ctrl+C，实际粘贴到了别的内容 / 完全没反应。
+        串口日志（RAW 1）如下：
+        # RAW h=0x0025 id=0x01 len=9 | ...
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: Windows 版本、Python 版本、ESP32-S3 板型
+      placeholder: Win11 24H2 / Python 3.13 / ESP32-S3-DevKitC-1
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 自查
+      options:
+        - label: 已把固件里的 `TARGET_ADDR` 改成自己遥控器的 MAC
+        - label: 已阅读 docs/troubleshooting.md
+        - label: 日志是文本粘贴，不是截图

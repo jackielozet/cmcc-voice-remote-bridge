@@ -1,0 +1,37 @@
+name: 适配新设备 / 功能建议
+description: 别的型号遥控器、新的映射能力、界面改进
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - 适配另一只遥控器
+        - 功能建议（映射/界面/命令行）
+        - 文档改进
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: 说明
+      description: |
+        适配新设备的话，请附上：广播名、`SCANDUMP 1` 的广播日志、`REPORTS` 的输出、
+        以及每个键 `LEARN 1` 打出来的 id。
+      placeholder: |
+        遥控器型号：……
+        广播名：……
+        REPORTS 输出：
+        R 0 id=0x01 type=1 h=0x0025 notify=1 sub=1
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 你希望它解决什么问题
+    validations:
+      required: false
