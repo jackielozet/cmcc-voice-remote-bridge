@@ -90,21 +90,39 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 ### 1. 烧固件
 
-用 Arduino IDE 打开 `firmware/cmcc_s3_bridge/cmcc_s3_bridge.ino`：
+仓库里有两个固件，按需要选一个（两个都保留，不会互相影响）：
+
+| 目录 | 说明 |
+|---|---|
+| `firmware/cmcc_s3_bridge_v3auto_20261029_0051/` | **推荐**。不写死任何设备信息，靠广播自动识别遥控器 |
+| `firmware/cmcc_s3_bridge/` | 最早一版。`TARGET_ADDR` 写死了一只遥控器的 MAC，换设备要改一行重烧 |
+
+两者的串口命令、NVS 映射表格式完全一致，`remotekey.ini` 也可以直接通用，可以随时换。
+
+用 Arduino IDE 打开对应目录里的 `.ino`：
 
 - 开发板：**ESP32S3 Dev Module**
 - **USB CDC On Boot：Enabled**（否则 `Serial` 不走 USB，配置工具连不上）
-- USB Mode 保持默认即可（TinyUSB 会由 HID 库自带启用）
+- USB Mode 保持默认
 - 其余默认
 
-或者用命令行（照抄即可，与本项目实测配置一致）：
+或者用命令行（与本项目实测配置一致）：
 
 ```bash
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc" firmware/cmcc_s3_bridge
-arduino-cli upload  --fqbn "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc" -p COM11 firmware/cmcc_s3_bridge
+FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc"
+arduino-cli compile --fqbn "$FQBN" firmware/cmcc_s3_bridge_v3auto_20261029_0051
+arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v3auto_20261029_0051
 ```
 
-**第一次用务必改这一行**（`cmcc_s3_bridge.ino` 顶部）：
+> **`upload` 报 `No serial data received` 是正常的。** S3 的 USB 口走 USB Serial/JTAG +
+> TinyUSB CDC，不响应 esptool 的标准复位序列。先让它进下载模式再传，三种办法任选：
+> 串口发 `BOOT`（固件自带，最省事）、拨 1200 波特率触发、
+> 或手动按住 **BOOT** 再点 **RST**。见 [`docs/build.md`](docs/build.md)。
+
+**v3 不需要改 MAC。** 第一次连上会把遥控器地址记进 NVS，之后开机直接找它。
+换另一只遥控器时要先清掉旧地址：串口发 `TARGET CLEAR`。
+
+**用 v1 的话，第一次务必改这一行**（`cmcc_s3_bridge.ino` 顶部）：
 
 ```cpp
 static const char *TARGET_ADDR = "0c:f3:cc:63:10:e3";   // 改成你自己遥控器的 MAC
@@ -112,7 +130,6 @@ static const char *TARGET_ADDR = "0c:f3:cc:63:10:e3";   // 改成你自己遥控
 
 不知道 MAC 就先用配置工具或串口终端发 `SCANDUMP 1`，然后按一下遥控器任意键，
 日志里会出现 `# ADV <地址> rssi=... name='CMCC_Voice_Remote'`，把它抄过来。
-（固件也会按名字和广播指纹兜底识别，但**连接时用的是这个 MAC**，所以必须对。）
 
 ### 2. 插上电脑
 
@@ -227,7 +244,10 @@ TV =
 2. **语音键只是唤起 Windows 语音输入**，用的是电脑麦克风。遥控器自带麦克风的私有通道
    （service `0x6287` / report `0xFC`）尚未解开：订阅后链路会被遥控器断开，音频编码也不是标准 IMA ADPCM
    （熵 7.35 比特/样本），仍在 `tools/hci/experiments/` 里留了复现脚本。
-3. **固件里硬编码了目标 MAC**（见「快速开始」）。换遥控器必须改一行再烧，暂时没做 NVS 配置。
+3. **v1 固件硬编码了目标 MAC**（`firmware/cmcc_s3_bridge/`），换遥控器必须改一行再烧。
+   v3 已去掉这个限制，改为广播打分自动识别 —— 但默认识别条件（HID Appearance `0x03C0`–`0x03C4`、
+   服务 UUID `0x1812`）**只在一种遥控器上验证过**，换型号能否认出取决于它的广播内容，
+   见 [`docs/auto-identify_20261029_0051.md`](docs/auto-identify_20261029_0051.md)。
 4. **只支持 Windows 侧的配置工具**。固件本身是标准 USB HID，Linux/macOS 插上也能当键盘用，
    但改键工具是 Tkinter + Win32 钩子写的，只在 Windows 上跑。
 5. **必须用 ESP32-S3（或 S2）**，普通 ESP32 没有 USB OTG。
@@ -291,7 +311,8 @@ Win+L 是 Windows 的安全保留动作，`WH_KEYBOARD_LL` 能拦别的热键（
 ```
 .
 ├── firmware/
-│   ├── cmcc_s3_bridge/      固件（Arduino sketch，主体）
+│   ├── cmcc_s3_bridge_v3auto_20261029_0051/  固件 v3：去掉写死设备信息，广播打分自动识别
+│   ├── cmcc_s3_bridge/      固件 v1：最早一版，TARGET_ADDR 写死一只遥控器
 │   └── cmcc_probe/          早期 BLE 特征探测 sketch（只用来 dump，不产出按键）
 ├── pc/                      配置工具（Tkinter，单文件可运行）
 │   ├── remote_ui.py         主程序
