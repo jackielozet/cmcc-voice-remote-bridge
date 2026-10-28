@@ -13,6 +13,10 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
+    env:
+      # 英文版 Windows runner 的控制台是 cp1252，直接 print 中文会抛 UnicodeEncodeError
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +36,12 @@ jobs:
       - name: 示例 ini 必须能全部解析
         working-directory: pc
         run: |
-          python -c "import remote_ui as R; d,b=R.read_ini('../remotekey.sample.ini'); print(len(d),'条 OK'); assert not b, b"
+          python -c "import remote_ui as R; d,b=R.read_ini('../remotekey.sample.ini'); print(len(d),'entries parsed OK'); assert not b, b"
 
       - name: 内置动作表必须双向自洽
         working-directory: pc
         run: |
-          python -c "import remote_ui as R; bad=[k for k,v in R.DEFAULT_ACTIONS.items() if R.parse_action(v) is None]; print(len(R.DEFAULT_ACTIONS),'条动作'); assert not bad, bad"
+          python -c "import remote_ui as R; bad=[k for k,v in R.DEFAULT_ACTIONS.items() if R.parse_action(v) is None]; print(len(R.DEFAULT_ACTIONS),'builtin actions'); assert not bad, bad"
 
   firmware:
     name: 固件结构检查
