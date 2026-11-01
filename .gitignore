@@ -32,6 +32,10 @@ btsnoop*.log
 
 # ---- 固件构建输出 ----
 firmware/**/build/
+# arduino-cli --build-path build_xxx
+firmware/**/build_*/
+# 改参数前的源码备份
+firmware/**/*.before_*
 build_s3/
 build_dbg/
 build_syntax/
@@ -41,6 +45,13 @@ build_cmcc/
 .build_dbg2/
 *.bin
 *.elf
+
+# ---- 语音实验数据（码流样本、抓包原始流）----
+*.g7221
+*.raw
+pc/asr_debug.log
+pc/diag.txt
+tools/*.log
 
 # ---- 编辑器 / 系统 ----
 .vscode/

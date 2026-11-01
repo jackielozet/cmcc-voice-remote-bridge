@@ -3,6 +3,9 @@
 把一只 **Windows 不认的移动定制蓝牙语音遥控器**，改成插上就能用的 USB 键盘：
 每个键映射成什么，用图形界面点一下就能改。
 
+遥控器上的麦克风也能用起来——**按住语音键说话，松手文字直接打到光标处，全程离线**，
+不联网、不装驱动、不占用系统麦克风。详见 [本地离线语音转文字](docs/local-asr.md)。
+
 ![主界面](docs/images/main-window.png)
 
 <sub>中文 | [English summary](#english-summary)</sub>
@@ -90,14 +93,16 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 ### 1. 烧固件
 
-仓库里有两个固件，按需要选一个（两个都保留，不会互相影响）：
+仓库里保留了三版固件，按需要选一个（都保留，不会互相影响）：
 
 | 目录 | 说明 |
 |---|---|
-| `firmware/cmcc_s3_bridge_v3auto_20261029_0051/` | **推荐**。不写死任何设备信息，靠广播自动识别遥控器 |
+| `firmware/cmcc_s3_bridge_v4voice_20261031_2226/` | **推荐**。自动识别 + **打开语音通道**，语音键能录音。要本地语音转文字就用这一版 |
+| `firmware/cmcc_s3_bridge_v3auto_20261029_0051/` | 只有按键，不订阅语音通道。不用语音功能就用它 |
 | `firmware/cmcc_s3_bridge/` | 最早一版。`TARGET_ADDR` 写死了一只遥控器的 MAC，换设备要改一行重烧 |
 
-两者的串口命令、NVS 映射表格式完全一致，`remotekey.ini` 也可以直接通用，可以随时换。
+三者的串口命令、NVS 映射表格式完全一致，`remotekey.ini` 也可以直接通用，可以随时换。
+从旧版本升级只烧 app（`0x10000`）即可，NVS 不动，已经调好的映射一条都不会丢。
 
 用 Arduino IDE 打开对应目录里的 `.ino`：
 
@@ -110,8 +115,8 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 ```bash
 FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc"
-arduino-cli compile --fqbn "$FQBN" firmware/cmcc_s3_bridge_v3auto_20261029_0051
-arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v3auto_20261029_0051
+arduino-cli compile --fqbn "$FQBN" firmware/cmcc_s3_bridge_v4voice_20261031_2226
+arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v4voice_20261031_2226
 ```
 
 > **`upload` 报 `No serial data received` 是正常的。** S3 的 USB 口走 USB Serial/JTAG +
@@ -119,7 +124,7 @@ arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v3auto_20261
 > 串口发 `BOOT`（固件自带，最省事）、拨 1200 波特率触发、
 > 或手动按住 **BOOT** 再点 **RST**。见 [`docs/build.md`](docs/build.md)。
 
-**v3 不需要改 MAC。** 第一次连上会把遥控器地址记进 NVS，之后开机直接找它。
+**v4 / v3 都不需要改 MAC。** 第一次连上会把遥控器地址记进 NVS，之后开机直接找它。
 换另一只遥控器时要先清掉旧地址：串口发 `TARGET CLEAR`。
 
 **用 v1 的话，第一次务必改这一行**（`cmcc_s3_bridge.ino` 顶部）：
@@ -137,6 +142,16 @@ static const char *TARGET_ADDR = "0c:f3:cc:63:10:e3";   // 改成你自己遥控
 第一次插可能需要几秒枚举。
 
 ### 3. 改键
+
+两种方式，任选：
+
+**A. 直接用绿色版**（不需要装 Python、不用配环境）
+
+到 [Releases](https://github.com/jackielozet/cmcc-voice-remote-bridge/releases) 下载
+`CMCC_RC_Keys_1.2.0_win64.zip`，解压到**有写权限**的目录（别放 `C:\Program Files`），
+双击里面的 `CMCC_RC_Keys.exe`。识别模型和解码器都在包里，Win10 / Win11 64 位开箱可用。
+
+**B. 跑源码**
 
 ```bash
 pip install -r pc/requirements.txt
@@ -167,6 +182,23 @@ python pc/remote_ui.py
 
 ---
 
+## 语音转文字（1.2.0 新增）
+
+勾选界面第二行的 **「勾选后语音键录音并直接输出文字」**，把光标放进任意输入框，
+**按住**遥控器语音键说话、**松手**，文字就上屏了。
+
+- 全程**本地离线**：sherpa-onnx + Paraformer 中文模型，不联网、不上传、不占系统麦克风；
+- 勾选期间语音键的原绑定被**屏蔽**——界面卡片变灰、点不出改键窗，系统也不会弹自己的语音输入框；
+  取消勾选立刻恢复原绑定；
+- 中文输出走「剪贴板 + Ctrl+V」（HID 键盘只能打 ASCII），注入后把你原来的剪贴板放回去。
+
+链路一句话：`0xFC 语音通道 → 按 seq 拼帧 → 去白化 → G.722.1 解码 → 剁开麦噪声/掐静音 → 识别 → 注入`。
+
+为什么要先剁掉开麦头 300 ms、为什么会有 15 秒熔断、识别率的天花板在哪，
+见 [docs/local-asr.md](docs/local-asr.md)。
+
+---
+
 ## 配置文件 `remotekey.ini`
 
 程序启动时的取值顺序：**同目录有 `remotekey.ini` 就用它，没有就按固件默认生成一份**。
@@ -178,7 +210,7 @@ python pc/remote_ui.py
 [keys]
 电源 = Win+L
 TV =
-设置 = Ctrl+C
+设置 = Win+I
 静音 = 静音
 ```
 
@@ -224,9 +256,9 @@ TV =
 | 遥控器键 | 默认动作 | 备注 |
 |---|---|---|
 | 电源（关机） | `Win+L` | 锁屏。想彻底不响应就清空 |
-| 录音（麦克风） | `Win+H` | 唤起 Windows 语音键入，用的是**电脑**麦克风 |
-| 设置 | `Ctrl+C` | 复制 |
-| M | `Ctrl+V` | 粘贴 |
+| 录音（麦克风） | `Win+H` | 唤起 Windows 语音键入；在配置工具里勾选「语音键录音并直接输出文字」后，改为用**遥控器麦克风**本地识别，这个热键被屏蔽 |
+| 设置 | `Win+I` | 打开 Windows 设置 |
+| M | `Ctrl+Z` | 撤销 |
 | `#` | `Delete` | 遥控器上没有 Del 键，借用 # |
 | 频道 + / − | `PageDown` / `PageUp` | 翻页 |
 | 音量 + / − / 静音 | 消费者控制 0xE9 / 0xEA / 0xE2 | 系统音量 |
@@ -241,16 +273,23 @@ TV =
 
 1. **TV 键无效**。实测按住 3 次、600 秒抓包窗口内零帧（连空白报告都没有），同一窗口下音量+ 正常上报，
    说明是遥控器固件把 TV 键直接交给了红外发射，蓝牙链路里根本没有这个键。
-2. **语音键只是唤起 Windows 语音输入**，用的是电脑麦克风。遥控器自带麦克风的私有通道
-   （service `0x6287` / report `0xFC`）尚未解开：订阅后链路会被遥控器断开，音频编码也不是标准 IMA ADPCM
-   （熵 7.35 比特/样本），仍在 `tools/hci/experiments/` 里留了复现脚本。
+2. **语音通道能用了，但只认中文**。固件 v4 已把 `0x6287` / `0xFC` 语音通道打开
+   （关键是 GATT 回调里不做阻塞发送，否则 ATT 无法回确认、遥控器会主动断链），
+   音频是 **G.722.1 / Siren 7 @ 16 kbps**，由 `decode.exe` 解成 16 kHz PCM。
+   识别模型是 `paraformer-zh-small`，**说英文会输出怪字甚至卡住**——为此外面套了 15 秒熔断。
+   音质上限由编码决定，叠加空口丢碎片（实测遥控器只发出按住时长的 25%–95%，无规律），
+   识别率的天花板在链路上，不在模型大小。详见 [`docs/local-asr.md`](docs/local-asr.md)。
 3. **v1 固件硬编码了目标 MAC**（`firmware/cmcc_s3_bridge/`），换遥控器必须改一行再烧。
-   v3 已去掉这个限制，改为广播打分自动识别 —— 但默认识别条件（HID Appearance `0x03C0`–`0x03C4`、
+   v3 / v4 已去掉这个限制，改为广播打分自动识别 —— 但默认识别条件（HID Appearance `0x03C0`–`0x03C4`、
    服务 UUID `0x1812`）**只在一种遥控器上验证过**，换型号能否认出取决于它的广播内容，
    见 [`docs/auto-identify_20261029_0051.md`](docs/auto-identify_20261029_0051.md)。
-4. **只支持 Windows 侧的配置工具**。固件本身是标准 USB HID，Linux/macOS 插上也能当键盘用，
-   但改键工具是 Tkinter + Win32 钩子写的，只在 Windows 上跑。
+4. **配置工具只在 Windows 上跑**。固件本身是标准 USB HID，Linux/macOS 插上也能当键盘用，
+   但改键工具是 Tkinter + Win32 钩子写的，绿色包只提供 Win10 / Win11 64 位。
+   目标程序若以管理员身份运行，本程序也要以管理员身份运行，否则钩子够不到它。
 5. **必须用 ESP32-S3（或 S2）**，普通 ESP32 没有 USB OTG。
+6. **语音功能涉及第三方许可**：`decode.exe` 是 GPL-2.0（独立进程，源码已随仓库提供），
+   G.722.1 本身涉及 Polycom 专利，识别模型权重上游未标注许可证。
+   商用前请先看 [`docs/third-party.md`](docs/third-party.md)。
 
 ---
 
@@ -311,25 +350,28 @@ Win+L 是 Windows 的安全保留动作，`WH_KEYBOARD_LL` 能拦别的热键（
 ```
 .
 ├── firmware/
-│   ├── cmcc_s3_bridge_v3auto_20261029_0051/  固件 v3：去掉写死设备信息，广播打分自动识别
+│   ├── cmcc_s3_bridge_v4voice_20261031_2226/ 固件 v4：自动识别 + 打开语音通道（推荐）
+│   ├── cmcc_s3_bridge_v3auto_20261029_0051/  固件 v3：只做按键，不订语音通道
 │   ├── cmcc_s3_bridge/      固件 v1：最早一版，TARGET_ADDR 写死一只遥控器
 │   └── cmcc_probe/          早期 BLE 特征探测 sketch（只用来 dump，不产出按键）
 ├── pc/                      配置工具（Tkinter，单文件可运行）
-│   ├── remote_ui.py         主程序
-│   ├── assets/              背景图、图标、原始照片
-│   ├── make_bg.py           照片 -> 白底背景（裁白边，免得运行时依赖 Pillow）
+│   ├── remote_ui.py         主程序：按键映射界面、串口、缩放
+│   ├── asr_win.py           语音转文字：拼帧 / 去白化 / 解码 / 预处理 / 识别 / 注入 / 语音键钩子
+│   ├── assets/              背景图、图标、原始照片、DPI manifest、版本信息
+│   ├── make_bg.py           照片 -> 白底背景
 │   ├── find_keys.py         自动定位每个键的坐标（连通域分析）
 │   ├── check_layout.py      布局自检：引线端点是否落在正确的键上
-│   ├── shot.py / shot_dlg.py 截图自检
+│   ├── shot*.py             截图自检（含发布主图）
 │   ├── test_*.py            各阶段自检（部分需要接硬件）
-│   ├── CMCC_RC_Keys.spec    PyInstaller 打包配置
+│   ├── CMCC_RC_Keys.spec    PyInstaller 打包配置（onedir 绿色包）
 │   └── build_exe.bat        一键打包
 ├── tools/                   逆向与分析脚本（见 tools/README.md）
 │   ├── ble/                 BLE 直连抓取（bleak）
 │   ├── hci/                 btsnoop / HCI 日志解析、报告表校验
 │   ├── uart/                遥控器调试焊盘串口嗅探
+│   ├── g7221-decoder/       decode.exe 的源码与构建说明（GPL-2.0）
 │   └── android-relay/       手机中继方案（已归档）
-├── docs/                    原理、协议、键表、编译、故障排查
+├── docs/                    原理、协议、键表、编译、语音识别、第三方许可、故障排查
 └── remotekey.sample.ini     配置文件示例
 ```
 
@@ -358,10 +400,28 @@ python pc/test_roundtrip.py      # 改键 -> 下发 -> 回读
 
 ## 致谢
 
-- [Arduino-ESP32](https://github.com/espressif/arduino-esp32)（Apache-2.0）——`USBHIDKeyboard` / `USBHIDConsumerControl` / `BLEDevice`
+固件与工具链：
+
+- [Arduino-ESP32](https://github.com/espressif/arduino-esp32)（LGPL-2.1-or-later）——`BLEDevice` / `Preferences` / USB HID
+- [ESP-IDF](https://github.com/espressif/esp-idf)（Apache-2.0）与 [NimBLE](https://github.com/apache/mynewt-nimble)——BLE 协议栈
 - [TinyUSB](https://github.com/hathach/tinyusb)（MIT）——复合 USB 设备
 - [bleak](https://github.com/hbldh/bleak)（MIT）——BLE 直连抓取脚本
-- [pyserial](https://github.com/pyserial/pyserial) / [Pillow](https://github.com/python-pillow/Pillow) / [PyInstaller](https://github.com/pyinstaller/pyinstaller)
+
+语音转文字：
+
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）——离线识别框架
+- [onnxruntime](https://github.com/microsoft/onnxruntime)（MIT）——推理运行时
+- [FunASR / Paraformer](https://github.com/modelscope/FunASR)（工具包 MIT，**模型权重单独授权**）——识别模型上游
+- [libg722_1](https://github.com/freeswitch/libg7221)（**GPL-2.0**）与 Polycom 的 ITU-T G.722.1 参考代码——Siren 7 解码
+
+界面与打包：
+
+- [pyserial](https://github.com/pyserial/pyserial)（BSD-3-Clause）/ [Pillow](https://github.com/python-pillow/Pillow)（MIT-CMU）/
+  [PyInstaller](https://github.com/pyinstaller/pyinstaller)（GPL-2.0 + 例外条款）
+
+**每个组件的版本、许可证义务、以及"再分发/商用要注意什么"，都写在
+[`docs/third-party.md`](docs/third-party.md)**——尤其 `decode.exe` 的 GPL-2.0 与
+G.722.1 的 Polycom 专利，商用前请务必先看。
 
 本项目对所有抓包与逆向工作只使用**自己拥有的设备**，不涉及任何加密内容破解。
 
@@ -369,7 +429,10 @@ python pc/test_roundtrip.py      # 改键 -> 下发 -> 回读
 
 ## 许可
 
-[MIT](LICENSE)。改硬件有风险（供电、静电、刷坏固件），一切后果自负；
+本项目代码以 [MIT](LICENSE) 发布。随发布物分发的第三方组件沿用各自许可证，
+其中 `decode.exe`（GPL-2.0）与识别模型权重的条款见 [`docs/third-party.md`](docs/third-party.md)。
+
+改硬件有风险（供电、静电、刷坏固件），一切后果自负；
 本项目和遥控器厂商、运营商无关。
 
 ---
@@ -401,12 +464,21 @@ push the table back over the serial port.
   restores it.
 - `remotekey.ini` next to the executable overrides the device table and is regenerated with defaults
   when missing.
+- **Offline speech-to-text (1.2.0)**: tick one box and the remote's own microphone becomes a dictation
+  key. The voice channel (`0x6287` / `0xFC`) is now usable in firmware v4 — the fix was to never block
+  inside the GATT callback, otherwise ATT notifications are not acknowledged and the remote drops the
+  link. Audio is G.722.1 / Siren 7 @ 16 kbps, decoded by `decode.exe`, then recognised by
+  sherpa-onnx + Paraformer-zh-small and injected at the caret via clipboard + `Ctrl+V`.
+  Everything stays local; see [`docs/local-asr.md`](docs/local-asr.md).
 - `tools/` keeps the full reverse-engineering trail: BLE inspection, btsnoop/HCI parsing, and the
   script that produced the "3 reports disagree" evidence.
 
 **Known limits.** The `TV` key sends nothing at all over BLE (the remote drives its IR LED directly);
-the microphone's private channel (`0x6287` / `0xFC`) is unsolved; the target remote's MAC is a
-compile-time constant.
+the speech model is Chinese-only (English input can hang the decoder, hence a 15 s watchdog);
+the target remote's MAC is a compile-time constant in v1 only. Third-party licensing —
+notably `decode.exe` under GPL-2.0 and the Polycom patents covering G.722.1 — is documented in
+[`docs/third-party.md`](docs/third-party.md).
 
 Build: see [`docs/build.md`](docs/build.md). Firmware targets Arduino-ESP32 3.3.12,
-FQBN `esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc`. License: MIT.
+FQBN `esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc`. License: MIT (third-party components
+keep their own licenses).

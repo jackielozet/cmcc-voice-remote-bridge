@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import messagebox
 
@@ -34,12 +35,23 @@ try:
 except ImportError:
     serial = None
 
+# 本地离线语音转文字（可选功能：缺了只是没有语音，不影响改键）
+_ASR_IMPORT_ERR = None
+try:
+    import asr_win
+    ASR_TIMEOUT_EXC = asr_win.AsrTimeout
+except Exception as _e:
+    asr_win = None
+    ASR_TIMEOUT_EXC = RuntimeError
+    _ASR_IMPORT_ERR = str(_e)
+
 # ------------------------------------------------------------------ 配色 --
 BG          = "#ffffff"     # 窗口底色：白
 PANEL       = "#f1f8f4"     # 浅绿灰（工具栏按钮底）
 CARD        = "#ffffff"     # 文本框底
 CARD_HOVER  = "#e6f7ec"     # 悬停（浅绿）
 CARD_NA     = "#f4f6f5"     # 无效键（TV）
+CARD_LOCK   = "#eef0ef"     # 被锁住的键（语音直出期间的麦克风键）
 BORDER      = "#a9dcbf"     # 普通边框（浅绿）
 BORDER_HOT  = "#17a35a"     # 高亮/已改（主绿）
 BORDER_NA   = "#b9c6bf"
@@ -55,8 +67,10 @@ BTN_FG      = "#ffffff"
 BTN2        = "#eef7f2"     # 次按钮底
 BTN2_FG     = "#2f6b4f"
 
-# 程序声明了 DPI 感知，1 单位 = 1 物理像素。高 DPI 屏上所有尺寸整体放大。
+# 程序声明了 DPI 感知，1 单位 = 1 物理像素。
+# Z 是全局缩放系数：启动时是下面这个基准值，用户拖窗口时按比例改。
 Z = 1.42
+Z_BASE = 1.42          # 用户拖拽缩放时的参照点
 
 
 def zp(x):
@@ -64,19 +78,54 @@ def zp(x):
 
 
 # ---- 画布布局（必须和 make_bg.py 里的算法一致）----
-CARD_W   = zp(172)
-CARD_H   = zp(27)
-PAD_Y    = zp(8)
+# 这些值全部由 init_metrics() 按当前 Z 算出来，改窗口大小时会再算一次。
+CARD_W = CARD_H = PAD_Y = 0
+IMG_H = IMG_W = IMG_K = OX = 0
+WIN_W = WIN_H = 0
 CROP_X0, CROP_X1 = 280, 520                    # 遥控器本体在原图上的横向范围
-IMG_H    = zp(800 * 0.98 + 16) - PAD_Y * 2     # 遥控器在窗口里的高度
-IMG_W    = int(round((CROP_X1 - CROP_X0) * IMG_H / 800.0))
-WIN_W    = CARD_W * 2 + zp(16) * 2 + IMG_W
-WIN_H    = zp(800 * 0.98 + 16)
-IMG_K    = IMG_H / 800.0                       # 原图 -> 窗口 的缩放比
-OX       = (WIN_W - IMG_W) // 2                # 图片左边距
 
 
-APP_TITLE = "CMCC 遥控器 - 按键映射"
+def init_metrics():
+    """按当前 Z 重算全部尺寸常量。窗口缩放时反复调用。"""
+    global CARD_W, CARD_H, PAD_Y, IMG_H, IMG_W, WIN_W, WIN_H, IMG_K, OX
+    CARD_W = zp(172)
+    CARD_H = zp(27)
+    PAD_Y = zp(8)
+    IMG_H = zp(800 * 0.98 + 16) - PAD_Y * 2     # 遥控器在窗口里的高度
+    IMG_W = int(round((CROP_X1 - CROP_X0) * IMG_H / 800.0))
+    WIN_W = CARD_W * 2 + zp(16) * 2 + IMG_W
+    WIN_H = zp(800 * 0.98 + 16)
+    IMG_K = IMG_H / 800.0                       # 原图 -> 窗口 的缩放比
+    OX = (WIN_W - IMG_W) // 2                   # 图片左边距
+
+
+init_metrics()
+
+
+APP_VER = "1.2.0"
+APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
+
+# 窗口最小客户区高度：按 768 高的屏幕算（768 - 任务栏 - 标题栏 ≈ 690）。
+# 再往下拖，字和框就挤成一团了，干脆锁死。
+MIN_CLIENT_H = 690
+
+# 勾选语音直出时要锁住的键（麦克风键）
+MIC_KID = 0x103E
+
+# 勾选后的说明文字（多处共用，改文案只改这里）
+# 单独占一行；窗口缩小时按实际宽度从上往下挑一条放得下的
+ASR_OFF_NOTES = [
+    "（本地离线识别，不用联网；勾选期间麦克风键原绑定功能被屏蔽）",
+    "（本地离线识别，不用联网；勾选期间语音键原绑定被屏蔽）",
+    "（本地离线识别，不用联网）",
+]
+ASR_OFF_NOTE = ASR_OFF_NOTES[0]
+
+# 单句识别硬超时：超过这么久还卡在「识别中」就放弃这一句。
+# onnxruntime 的 decode 是纯 C 调用，Python 杀不掉，所以这里是"放弃 + 重建识别器"，
+# 不是真的终止那个线程 —— 只要后面的识别不再被它堵住就行。
+ASR_TIMEOUT_S = 15.0
+ASR_TIMEOUT_MS = int(ASR_TIMEOUT_S * 1000)
 
 # ------------------------------------------------------------------ 键位 --
 # 原图是 800x800，遥控器本体居中。下面是每个键在原图上的中心坐标。
@@ -142,6 +191,35 @@ MEDIA_NAME = {
 MEDIA_USAGE = {v: k for k, v in MEDIA_NAME.items()}
 
 MOD_LABEL = {MOD_CTRL: "Ctrl", MOD_SHIFT: "Shift", MOD_ALT: "Alt", MOD_WIN: "Win"}
+
+# 语音转文字时要拦截语音键：HID usage -> Windows 虚拟键码
+HID_MOD_TO_VK = {0xE0: 0x11, 0xE1: 0x10, 0xE2: 0x12, 0xE3: 0x5B,   # Ctrl/Shift/Alt/Win
+                 0xE4: 0x11, 0xE5: 0x10, 0xE6: 0x12, 0xE7: 0x5B}   # 右变体
+
+_HID_SPECIAL_VK = {
+    0x28: 0x0D, 0x29: 0x1B, 0x2A: 0x08, 0x2B: 0x09, 0x2C: 0x20,      # 回车 Esc 退格 Tab 空格
+    0x2D: 0xBD, 0x2E: 0xBB, 0x2F: 0xDB, 0x30: 0xDD, 0x31: 0xDC,
+    0x33: 0xBA, 0x34: 0xDE, 0x35: 0xC0, 0x36: 0xBC, 0x37: 0xBE, 0x38: 0xBF,
+    0x39: 0x14,                                                       # CapsLock
+    0x49: 0x2D, 0x4A: 0x24, 0x4B: 0x21, 0x4C: 0x2E, 0x4D: 0x23, 0x4E: 0x22,
+    0x4F: 0x27, 0x50: 0x25, 0x51: 0x28, 0x52: 0x26,                   # 方向键
+    0x65: 0x5D,                                                       # 菜单键
+}
+
+
+def hid_to_vk(u):
+    """HID keyboard usage -> Windows VK。认不出返回 0。"""
+    if 0x04 <= u <= 0x1D:                 # A-Z
+        return 0x41 + (u - 0x04)
+    if 0x1E <= u <= 0x26:                 # 1-9
+        return 0x31 + (u - 0x1E)
+    if u == 0x27:                         # 0
+        return 0x30
+    if 0x3A <= u <= 0x45:                 # F1-F12
+        return 0x70 + (u - 0x3A)
+    if 0x68 <= u <= 0x73:                 # F13-F24
+        return 0x7C + (u - 0x68)
+    return _HID_SPECIAL_VK.get(u, 0)
 
 # 文本框窄，太长的动作名换成短名，否则会和左边的键名撞在一起
 SHORT = {
@@ -524,12 +602,12 @@ MOD_PARSE = {
 }
 REV_SHORT = {v: k for k, v in SHORT.items()}
 
-# 首次生成 ini 用的默认动作（与设备出厂默认一致）
+# 首次生成 ini 用的默认动作（与设备出厂默认一致，对应固件 migv=4）
 DEFAULT_ACTIONS = {
-    "电源": "Win+L", "TV": "", "设置": "Ctrl+C", "静音": "静音",
+    "电源": "Win+L", "TV": "", "设置": "Win+I", "静音": "静音",
     "上": "↑", "左": "←", "确定": "回车", "右": "→", "下": "↓",
     "菜单": "菜单键", "返回": "Esc", "麦克风": "Win+H",
-    "音量+": "音量 +", "音量-": "音量 -", "主页": "Win", "M": "Ctrl+V",
+    "音量+": "音量 +", "音量-": "音量 -", "主页": "Win", "M": "Ctrl+Z",
     "频道+": "PageDown", "频道-": "PageUp",
     "1": "1", "2": "2", "3": "3", "4": "4", "5": "5",
     "6": "6", "7": "7", "8": "8", "9": "9", "0": "0",
@@ -1018,13 +1096,72 @@ class Recorder(tk.Toplevel):
         self.on_ok(out_type, keys, n)
 
 
+# --------------------------------------------------------------- 大勾选框 --
+class BigCheck(tk.Frame):
+    """放大版勾选框。
+
+    Tk 原生 Checkbutton 的小方块只有 12px 左右，跟着字号也没法单独放大，
+    看着像一行灰字。这里自己画一个方块 + 白色对勾，点方块或点文字都能勾选。
+    对外仍用 BooleanVar，其它代码照旧 var.get()/set()。
+    """
+
+    def __init__(self, master, text, var, command=None, box=22):
+        tk.Frame.__init__(self, master, bg=BG)
+        self.var = var
+        self.command = command
+        self._box = box                      # 逻辑边长，实际按 zp() 缩放
+        s = zp(box)
+        self.cv = tk.Canvas(self, width=s, height=s, bg=BG,
+                            highlightthickness=0, bd=0)
+        self.cv.pack(side="left")
+        self.lbl = tk.Label(self, text=text, bg=BG, fg=TEXT,
+                            font=("Microsoft YaHei UI", zp(10), "bold"))
+        self.lbl.pack(side="left", padx=(zp(8), 0))
+        for w in (self.cv, self.lbl):
+            w.bind("<Button-1>", self._click)
+            w.configure(cursor="hand2")
+        try:
+            self._trace = var.trace_add("write", lambda *a: self.sync())
+        except Exception:
+            self._trace = None
+        self.sync()
+
+    def _click(self, ev=None):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+        self.after(0, self.sync)             # 被外部回滚时也刷一次
+
+    def sync(self):
+        try:
+            cv = self.cv
+            cv.delete("all")
+            s = zp(self._box)
+            e = max(1, zp(1))
+            on = bool(self.var.get())
+            cv.create_rectangle(e, e, s - e, s - e,
+                                fill=(ACCENT if on else "#ffffff"),
+                                outline=(ACCENT if on else "#3f9670"),
+                                width=max(2, zp(2)))
+            if on:
+                w = max(3, zp(2.4))          # 白色对勾，尽量粗，一眼能看见
+                cv.create_line(s * 0.23, s * 0.52, s * 0.42, s * 0.72,
+                               fill="#ffffff", width=w,
+                               capstyle="round", joinstyle="round")
+                cv.create_line(s * 0.42, s * 0.72, s * 0.78, s * 0.28,
+                               fill="#ffffff", width=w,
+                               capstyle="round", joinstyle="round")
+        except Exception:
+            pass
+
+
 # ------------------------------------------------------------------- 主窗 --
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
         self.configure(bg=BG)
-        self.resizable(False, False)
+        self.resizable(True, True)      # 允许拖拽，内容等比缩放
 
         LockGuard.restore_stale()   # 上次被强杀留下的"禁锁屏"痕迹，先还原
 
@@ -1037,14 +1174,472 @@ class App(tk.Tk):
         self.hover = None
         self.ini_note = ""
 
-        self._build()
+        # ---- 等比缩放状态 ----
+        self._base_wh = None        # 首次构建出的基准尺寸（缩放参照）
+        self._cur_k = 1.0           # 当前缩放比
+        self._resize_job = None     # 防抖用
+        self._building = False      # 重建中，忽略 Configure
+
+        # ---- 语音转文字状态 ----
+        self.asr_on = False
+        self.asr_engine = None      # asr_win.AsrEngine
+        self.asr_hook = None        # 吞掉语音键组合的钩子
+        self.asr_framer = None
+        self.asr_codec = bytearray()
+        self.asr_last = 0.0         # 最后一次收到音频帧的时刻
+        self.asr_busy = False       # 正在识别，别叠着跑
+        self.asr_lock = threading.Lock()
+        self.asr_count = 0          # 本次开启后识别过几句
+        self._asr_poll = None
+        self.asr_gen = 0            # 识别代次：超时作废后，晚到的结果一律丢弃
+        self._asr_wd = None         # 15 秒熔断看门狗的 after id
+        self._asr_waiter = None     # 传给引擎的"别要结果了"旗标
+        self.asr_timeouts = 0       # 熔断过几次（诊断用）
+
+        self._fit_z_to_screen()
+        self._build(fix_size=True)
+        self._set_size_limits()
         self._load_ini()
         self.refresh_ports()
         self._drain()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Configure>", self._on_configure)
+
+    # --------------------------------------------------------- 等比缩放 --
+    def _fit_z_to_screen(self):
+        """启动时按屏幕可用高度收 Z：换到 1080p 小屏也不会开在屏幕外面。"""
+        global Z
+        try:
+            sh = self.winfo_screenheight()
+        except Exception:
+            return
+        if not sh or sh <= 200:
+            return
+        avail = sh * 0.90
+        est = WIN_H + zp(140)              # 画布 + 上下两条工具栏
+        if est > avail > 0:
+            Z = Z * (avail / est)
+            init_metrics()
+
+    def _set_size_limits(self):
+        """限制可拖范围。
+
+        下限定成"768 高的屏幕也放得下"：再小字就糊成一团了，直接不让拖。
+        上限压到屏幕工作区：窗口高过屏幕会让底部按钮跑到屏幕外，够不着。
+        """
+        if not self._base_wh:
+            return
+        bw, bh = self._base_wh
+        if bh <= 0:
+            return
+        min_h = min(MIN_CLIENT_H, bh)                 # 768 屏的可用高度
+        try:
+            self.minsize(int(round(bw * min_h / float(bh))), min_h)
+        except Exception:
+            pass
+        try:
+            work_h = self._work_area_h()
+            if work_h:
+                max_h = max(min_h, min(int(work_h) - 48, int(bh * 2.6)))
+                self.maxsize(int(round(bw * max_h / float(bh))), max_h)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _work_area_h():
+        """屏幕工作区高度（扣掉任务栏）。拿不到就返回 0。"""
+        try:
+            r = wintypes.RECT()
+            SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
+                return r.bottom - r.top
+        except Exception:
+            pass
+        return 0
+
+    def _on_configure(self, ev):
+        """窗口被拖动后按高度比例重算尺寸。260ms 防抖，拖动过程不狂重建。"""
+        if ev.widget is not self or self._building or not self._base_wh:
+            return
+        bh = self._base_wh[1]
+        h = self.winfo_height()
+        if h < 200 or bh <= 0:
+            return
+        k = h / float(bh)
+        if abs(k - self._cur_k) < 0.02:
+            return
+        self._pending_k = max(0.45, min(2.6, k))
+        if self._resize_job:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after(260, self._do_resize)
+
+    def _do_resize(self):
+        self._resize_job = None
+        k = getattr(self, "_pending_k", 1.0)
+        if abs(k - self._cur_k) < 0.02:
+            return
+        self._apply_scale(k)
+
+    def _apply_scale(self, k):
+        """按 k 重算全部尺寸并重建界面。串口连接 / 配置 / 勾选状态都保留。"""
+        global Z
+        self._building = True
+        try:
+            port = self.cbo_port.get().strip()
+            status = self.lbl_status.cget("text")
+            conn_txt = self.btn_conn.cget("text")
+            dirty = self.lbl_dirty.cget("text")
+            hint = self.lbl_hint.cget("text")
+            asr_on = self.var_asr.get()
+            asr_txt = self.lbl_asr.cget("text")
+            asr_fg = self.lbl_asr.cget("fg")
+
+            Z = self._base_z * k
+            init_metrics()
+            self._cur_k = k
+
+            for w in self.winfo_children():
+                w.destroy()
+            self.cards.clear()
+            self.hover = None
+            self._build(fix_size=False)
+
+            self.cbo_port.delete(0, "end")
+            if port:
+                self.cbo_port.insert(0, port)
+            self.lbl_status.configure(
+                text=status, fg=(ACCENT if self.ser is not None else "#c9553f"))
+            self.btn_conn.configure(text=conn_txt)
+            self.lbl_hint.configure(text=hint)
+            self.var_asr.set(asr_on)
+            # 没勾选就换成这次按新字宽挑的那条说明，别把旧的长句塞回去
+            self.lbl_asr.configure(
+                text=(asr_txt if asr_on else self._off_note), fg=asr_fg)
+            self._refresh_all()
+            self._mark_dirty()
+            self._sync_asr_lock()      # 重建后勾选状态要跟着恢复锁定
+            self.lbl_dirty.configure(text=dirty)
+        except Exception:
+            pass
+        finally:
+            self.after(80, self._end_building)
+
+    def _end_building(self):
+        self._building = False
+
+    # ------------------------------------------------------- 语音转文字 --
+    def _asr_status(self, text, fg=None):
+        try:
+            self.lbl_asr.configure(text=text, fg=(fg or TEXT_DIM))
+        except Exception:
+            pass
+
+    def toggle_asr(self):
+        if self.var_asr.get():
+            if not self._asr_start():
+                self.var_asr.set(False)
+        else:
+            self._asr_stop()
+
+    def _asr_start(self):
+        if asr_win is None:
+            messagebox.showerror(
+                "语音功能不可用",
+                "本地语音模块加载失败：\n%s\n\n改键功能不受影响。" % (_ASR_IMPORT_ERR or "未知"))
+            return False
+        if self.ser is None:
+            messagebox.showwarning("未连接", "先连接设备，再开语音转文字。")
+            return False
+
+        eng = self.asr_engine or asr_win.AsrEngine()
+        if not eng.available():
+            messagebox.showerror(
+                "缺少语音模型",
+                "找不到识别模型（models/sherpa-onnx-paraformer-zh-small-2024-03-09）。\n\n"
+                "把 models 目录放到程序旁边即可启用；改键功能不受影响。")
+            return False
+        if not asr_win.find_decoder():
+            messagebox.showerror(
+                "缺少解码器",
+                "找不到 decode.exe（tools/libg7221/）。\n\n改键功能不受影响。")
+            return False
+        self.asr_engine = eng
+
+        # 语音键当前绑定 -> 要吞掉的 VK（拦不住就只做识别，不屏蔽原键）
+        vk, mods, why = self._voice_key_vk()
+        if self.asr_hook:
+            self.asr_hook.stop()
+            self.asr_hook = None
+        if vk:
+            hk = asr_win.VoiceKeyHook(vk, mods, None, None)
+            if hk.start():
+                self.asr_hook = hk
+            else:
+                why = "键盘钩子安装失败（可能被杀软拦），系统语音输入不会被屏蔽"
+
+        self.asr_framer = asr_win.Framer()
+        with self.asr_lock:
+            self.asr_codec = bytearray()
+        self.asr_last = 0.0
+        self.asr_count = 0
+        self.asr_busy = False
+        self.asr_gen += 1
+        self.asr_timeouts = 0
+        self._asr_disarm_watchdog()
+        self.asr_on = True
+
+        if not self.send("AUDIO 1"):
+            self.asr_on = False
+            return False
+
+        if self._asr_poll:
+            try:
+                self.after_cancel(self._asr_poll)
+            except Exception:
+                pass
+        self._asr_poll = self.after(150, self._asr_tick)
+
+        threading.Thread(target=self._asr_warmup, daemon=True).start()
+
+        tip = "就绪，麦克风键已锁定 · 按住说话" + (("（%s）" % why) if why else "")
+        self._asr_status("● " + tip, ACCENT)
+        self._sync_asr_lock()        # 勾上就把麦克风键锁灰、点不动
+        return True
+
+    def _asr_warmup(self):
+        try:
+            self.asr_engine.load()
+            msg = "● 就绪，麦克风键已锁定 · 按住说话（模型 %d ms）" % self.asr_engine.load_ms
+            self.after(0, lambda: self._asr_status(msg, ACCENT))
+        except Exception as e:
+            self.after(0, lambda: self._asr_status("● 模型加载失败：%s" % e, "#c9553f"))
+
+    def _voice_key_vk(self):
+        """读麦克风键的绑定，换算成要拦截的 VK。
+
+        优先用设备实际回报的绑定（self.bindings），那才是按下时真会发出去的键；
+        没连上设备时退回 ini 里的配置。
+        返回 (vk, mods, 说明)；vk=0 表示拦不了（比如绑成多媒体键）。
+        """
+        dev = self.bindings.get(MIC_KID)
+        if dev:
+            ot, n = dev["out_type"], dev["n"]
+            keys = list(dev["keys"])
+            src = "设备"
+        else:
+            rec = self.ini.get("麦克风")
+            if not rec:
+                return 0, set(), "麦克风键没配置"
+            ot, keys, n = rec
+            src = "配置"
+        if n == 0:
+            return 0, set(), "麦克风键当前是「不响应」"
+        if ot != 1:
+            return 0, set(), "麦克风键绑的是多媒体键（%s），PC 侧拦不住多媒体键，" \
+                             "请改成键盘组合" % src
+        mods, main = set(), None
+        for i in range(n):
+            k = keys[i]
+            if k == 0:
+                continue
+            if 0xE0 <= k <= 0xE7:
+                m = HID_MOD_TO_VK.get(k)
+                if m:
+                    mods.add(m)
+            else:
+                main = k
+        if main is None:
+            return 0, set(), "麦克风键没绑主键"
+        vk = hid_to_vk(main)
+        if not vk:
+            return 0, mods, "这个键不支持接管"
+        return vk, mods, ""
+
+    def _on_audio_line(self, line):
+        """串口读到 "A <HEX>"（在读取线程里跑）。只拼帧，绝不碰 tkinter。"""
+        if not self.asr_on or self.asr_framer is None:
+            return
+        try:
+            payload = bytes.fromhex(line[2:].strip())
+        except ValueError:
+            return
+        frame = self.asr_framer.feed(payload)
+        if frame is None:
+            return
+        with self.asr_lock:
+            self.asr_codec += asr_win.dewhite(frame)
+        self.asr_last = time.time()
+
+    def _asr_tick(self):
+        """主线程轮询：静默超过 SILENCE_MS 就把这段送去识别。"""
+        self._asr_poll = None
+        if not self.asr_on:
+            return
+        try:
+            now = time.time()
+            with self.asr_lock:
+                n = len(self.asr_codec)
+            max_bytes = int(asr_win.CODEC_BYTES * 50 * asr_win.MAX_SECONDS)
+            if n > max_bytes:
+                # 说太久，截断保护
+                with self.asr_lock:
+                    self.asr_codec = bytearray()
+            elif n and not self.asr_busy and \
+                    now - self.asr_last > asr_win.SILENCE_MS / 1000.0:
+                with self.asr_lock:
+                    codec = bytes(self.asr_codec)
+                    self.asr_codec = bytearray()
+                # 半截碎片必须清掉：否则它的后半截到齐后会拼成"上一句的尾巴"，
+                # 混进下一句的开头（听感就是上一句最后一个字被带了过来）
+                if self.asr_framer:
+                    self.asr_framer.reset()
+                self.asr_busy = True
+                self.asr_gen += 1
+                gen = self.asr_gen
+                self._asr_status("● 识别中…", WARN)
+                self._asr_arm_watchdog(gen)      # 先挂看门狗（会新建 waiter）
+                waiter = self._asr_waiter
+                threading.Thread(target=self._asr_run, args=(codec, gen, waiter),
+                                 daemon=True).start()
+        finally:
+            if self.asr_on:
+                self._asr_poll = self.after(120, self._asr_tick)
+
+    # ---- 15 秒熔断 ----
+    def _asr_arm_watchdog(self, gen):
+        """派发识别时挂一个看门狗；到点还没结束就放弃这一句。"""
+        self._asr_disarm_watchdog()
+        self._asr_waiter = threading.Event()
+        self._asr_wd = self.after(ASR_TIMEOUT_MS, lambda: self._asr_timeout(gen))
+
+    def _asr_disarm_watchdog(self):
+        if self._asr_wd:
+            try:
+                self.after_cancel(self._asr_wd)
+            except Exception:
+                pass
+            self._asr_wd = None
+
+    def _asr_timeout(self, gen):
+        self._asr_wd = None
+        if gen != self.asr_gen or not self.asr_busy:
+            return                       # 已经出结果了，这个看门狗来晚了
+        self.asr_timeouts += 1
+        self.asr_gen += 1                # 代次 +1：这条线程晚到的结果一律作废
+        self.asr_busy = False
+        if self._asr_waiter is not None:
+            self._asr_waiter.set()       # 告诉还在 decode 的那条线程：结果别要了
+        with self.asr_lock:
+            self.asr_codec = bytearray()
+        if self.asr_framer:
+            self.asr_framer.reset()
+        self.asr_last = 0.0
+        # 关键：把卡死的识别器整份丢掉，下次识别重建一个新的，
+        # 否则下一次还会排在同一把被占死的锁上，一直卡。
+        try:
+            if self.asr_engine is not None:
+                self.asr_engine.reset()
+        except Exception:
+            pass
+        if asr_win is not None:
+            asr_win.debug_log("识别超时 %.0fs，已放弃这一句并重建识别器（第 %d 次）"
+                              % (ASR_TIMEOUT_MS / 1000.0, self.asr_timeouts))
+        self._asr_status(
+            "● 识别超时（%.0f 秒）已放弃，可以继续说" % (ASR_TIMEOUT_MS / 1000.0),
+            "#c9553f")
+
+    def _asr_run(self, codec, gen=0, waiter=None):
+        """后台线程：解码 + 预处理 + 识别，完成后回主线程注入。"""
+        text, err, ms = "", None, 0
+        note = ""
+        samples = None
+        try:
+            t0 = time.time()
+            pcm = asr_win.decode_codec(codec)
+            if len(pcm) < 3200:                 # <100ms，别浪费算力
+                raise RuntimeError("音频太短")
+            # 抠开麦爆音 + 掐首尾静音 + 归一化，否则模型会对着噪声瞎猜
+            samples, note = asr_win.prepare_audio(asr_win.pcm_to_float(pcm))
+            if samples is None:
+                raise RuntimeError("没听到说话声（%s）" % note)
+            text = self.asr_engine.transcribe(samples, waiter=waiter)
+            ms = int((time.time() - t0) * 1000)
+        except ASR_TIMEOUT_EXC as e:
+            err = "超时已放弃（%s）" % e
+        except Exception as e:
+            err = str(e)
+        dur = len(codec) / float(asr_win.CODEC_BYTES) * asr_win.FRAME_MS / 1000.0
+        if asr_win is not None:
+            asr_win.debug_log("码流%.2fs 音频%.2fs %s → %s%s"
+                              % (dur, len(samples) / 16000.0 if samples is not None
+                                 else 0.0, note,
+                                 ("「%s」" % text) if text else "(空)",
+                                 ("  错误：%s" % err) if err else ""))
+        try:
+            self.after(0, lambda: self._asr_done(text, err, ms, dur, note, gen))
+        except Exception:
+            pass
+
+    def _asr_done(self, text, err, ms, dur, note="", gen=0):
+        if gen and gen != self.asr_gen:
+            # 这句已经被 15 秒熔断判弃了，结果来晚了，别再注入
+            asr_win.debug_log("丢弃超时后迟到的结果")
+            return
+        self._asr_disarm_watchdog()
+        self.asr_busy = False
+        if err:
+            self._asr_status("● %s" % err, "#c9553f")
+            return
+        if not text:
+            self._asr_status("● 没识别出文字（%.1fs 音频，可能没收到声音）" % dur, WARN)
+            return
+        ok = asr_win.inject_text(text)
+        self.asr_count += 1
+        short = text if len(text) <= 20 else text[:20] + "…"
+        self._asr_status("● 已输入 %d 字：%s（%.1fs 音频 / %dms）%s" %
+                         (len(text), short, dur, ms,
+                          "" if ok else "  ※注入失败"), ACCENT if ok else "#c9553f")
+
+    def _asr_stop(self):
+        self.asr_on = False
+        if self._asr_poll:
+            try:
+                self.after_cancel(self._asr_poll)
+            except Exception:
+                pass
+            self._asr_poll = None
+        if self.asr_hook:
+            self.asr_hook.stop()
+            self.asr_hook = None
+        with self.asr_lock:
+            self.asr_codec = bytearray()
+        self.asr_framer = None
+        self.asr_busy = False
+        self.asr_gen += 1               # 关掉时进行中的识别结果一律作废
+        self._asr_disarm_watchdog()
+        if self._asr_waiter is not None:
+            self._asr_waiter.set()
+        if self.ser is not None:
+            try:
+                self.ser.write(b"AUDIO 0\n")   # 直接写，别走 send()（会弹框）
+            except Exception:
+                pass
+        self._asr_status(getattr(self, "_off_note", ASR_OFF_NOTE), TEXT_DIM)
+        try:
+            self._sync_asr_lock()    # 解锁：麦克风键恢复原绑定功能
+        except Exception:
+            pass
 
     def _on_close(self):
+        try:
+            self._asr_stop()        # 必须先放掉键盘钩子，否则键盘一直被吞
+        except Exception:
+            pass
         if self.changed:
             r = messagebox.askyesnocancel(
                 "有改动未保存",
@@ -1092,7 +1687,7 @@ class App(tk.Tk):
         ot, keys, n = r
         return describe(ot, keys, n)
 
-    def _build(self):
+    def _build(self, fix_size=False):
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=zp(14), pady=(zp(10), zp(4)))
 
@@ -1116,9 +1711,33 @@ class App(tk.Tk):
                                    font=("Microsoft YaHei UI", zp(9)))
         self.lbl_status.pack(side="left")
 
+        # 右上角版本号：先 pack 的靠最右，钉死在角落，不会被左边的提示文字挤动
+        self.lbl_ver = tk.Label(top, text="v" + APP_VER, bg=BG, fg=TEXT_DIM,
+                                font=("Consolas", zp(9), "bold"))
+        self.lbl_ver.pack(side="right")
+
         self.lbl_hint = tk.Label(top, text="", bg=BG, fg=TEXT_DIM,
                                  font=("Microsoft YaHei UI", zp(9)))
-        self.lbl_hint.pack(side="right")
+        self.lbl_hint.pack(side="right", padx=(0, zp(10)))
+
+        # ---- 第二行：本地离线语音转文字开关 ----
+        row2 = tk.Frame(self, bg=BG)
+        row2.pack(fill="x", padx=zp(14), pady=(zp(4), 0))
+
+        self.var_asr = tk.BooleanVar(value=False)
+        self.chk_asr = BigCheck(
+            row2, text="勾选后语音键录音并直接输出文字",
+            var=self.var_asr, command=self.toggle_asr, box=22)
+        self.chk_asr.pack(side="left")
+
+        # ---- 第三行：说明 / 运行状态（单独占一行，不与勾选框抢宽度）----
+        row3 = tk.Frame(self, bg=BG)
+        row3.pack(fill="x", padx=(zp(14) + zp(22) + zp(8)), pady=(zp(1), 0))
+        self._off_note = self._pick_note(ASR_OFF_NOTES)
+        self.lbl_asr = tk.Label(
+            row3, text=self._off_note, anchor="w",
+            bg=BG, fg=TEXT_DIM, font=("Microsoft YaHei UI", zp(9)))
+        self.lbl_asr.pack(side="left")
 
         area = tk.Frame(self, bg=BG)
         area.pack(fill="both", expand=True, padx=0, pady=0)
@@ -1154,7 +1773,32 @@ class App(tk.Tk):
 
         # 窗口高度按实际需要算：画布 + 上下两条工具栏，否则底部按钮会被挤出去
         self.update_idletasks()
-        self.geometry("%dx%d" % (WIN_W + zp(20), self.winfo_reqheight() + zp(4)))
+        w = WIN_W + zp(20)
+        h = self.winfo_reqheight() + zp(4)
+        if fix_size or self._base_wh is None:
+            self._base_wh = (w, h)
+            self._base_z = Z
+            self.geometry("%dx%d" % (w, h))
+            # 锁死纵横比：拖拽时内容整体等比缩放，不会把遥控器拉扁
+            try:
+                self.wm_aspect(w, h, w, h)
+            except Exception:
+                pass
+
+    def _pick_note(self, cands):
+        """挑一条能在当前窗口宽度里放得下的说明文字。
+
+        字号按 zp() 取整，窗口越小字相对越宽，固定一条会在右边缘被切掉。
+        """
+        avail = WIN_W - (zp(14) + zp(22) + zp(8)) - zp(10)
+        try:
+            f = tkfont.Font(family="Microsoft YaHei UI", size=zp(9))
+            for s in cands:
+                if f.measure(s) <= avail:
+                    return s
+        except Exception:
+            pass
+        return cands[-1]
 
     def _win_w(self):
         return WIN_W
@@ -1163,18 +1807,46 @@ class App(tk.Tk):
         return WIN_H
 
     def _draw_background(self):
-        """背景图（遥控器照片，白底）。找不到就用纯色。"""
-        path = self._asset("bg.png")
+        """背景：按当前 Z 从原图重绘，保证照片永远和引线框对得上。
+
+        以前贴的是预先烤好的 bg.png（尺寸死锁在 Z=1.42），窗口一缩放，
+        照片尺寸不变而引线框在缩，整屏就错位了。
+        """
         self.bg_img = None
+        if self._draw_bg_scaled():
+            return
+        # 退化路径：没有 Pillow 或原图缺失时沿用旧 bg.png（缩放后可能对不齐）
+        path = self._asset("bg.png")
         if path and os.path.exists(path):
             try:
                 self.bg_img = tk.PhotoImage(file=path)
-                w, h = self.bg_img.width(), self.bg_img.height()
-                self.canvas.create_image(w // 2, h // 2, image=self.bg_img)
+                self.canvas.create_image(WIN_W // 2, WIN_H // 2, image=self.bg_img)
                 return
             except Exception:
                 self.bg_img = None
         self.canvas.configure(bg=BG)
+
+    def _draw_bg_scaled(self):
+        """用 Pillow 把 remote.jpg 按当前窗口尺寸裁切 + 缩放后画上去。"""
+        src = self._asset("remote.jpg")
+        if not src or IMG_W <= 0 or IMG_H <= 0:
+            return False
+        try:
+            from PIL import Image, ImageTk
+        except Exception:
+            return False
+        try:
+            im = Image.open(src).convert("RGB")
+            im = im.crop((CROP_X0, 0, CROP_X1, im.size[1]))
+            im = im.resize((IMG_W, IMG_H), Image.LANCZOS)
+            bg = Image.new("RGB", (WIN_W, WIN_H), (255, 255, 255))
+            bg.paste(im, ((WIN_W - IMG_W) // 2, PAD_Y))
+            self.bg_img = ImageTk.PhotoImage(bg)
+            self.canvas.create_image(0, 0, anchor="nw", image=self.bg_img)
+            return True
+        except Exception:
+            self.bg_img = None
+            return False
 
     @staticmethod
     def _asset(name):
@@ -1215,8 +1887,8 @@ class App(tk.Tk):
         """一个键：锚点 + 引线 + 文本框。锚点落在键的一侧，线不压住键本身。"""
         na = (kid == 0)
         ax = kx + side * zp(17)
-        self.canvas.create_oval(ax - zp(2.5), ky - zp(2.5), ax + zp(2.5), ky + zp(2.5),
-                                fill=(LEAD if not na else BORDER_NA), outline="")
+        dot = self.canvas.create_oval(ax - zp(2.5), ky - zp(2.5), ax + zp(2.5), ky + zp(2.5),
+                                      fill=(LEAD if not na else BORDER_NA), outline="")
 
         edge = cx - side * (CARD_W / 2)
         line = self.canvas.create_line(ax, ky, edge, cy, fill=(LEAD if not na else BORDER_NA),
@@ -1235,8 +1907,9 @@ class App(tk.Tk):
                                       fill=(TEXT if not na else BORDER_NA),
                                       font=("Microsoft YaHei UI", zp(10), "bold"))
         self.cards[kid if kid else ("na", label)] = dict(
-            rect=rect, name=name, value=val, line=line,
-            kid=kid, label=label, x1=x1, y1=y1, x2=x2, y2=y2, na=na)
+            rect=rect, name=name, value=val, line=line, dot=dot,
+            kid=kid, label=label, x1=x1, y1=y1, x2=x2, y2=y2, na=na,
+            lock=False)
 
     # --------------------------------------------------------- 悬停/点击 --
     def _hit(self, x, y):
@@ -1254,12 +1927,16 @@ class App(tk.Tk):
         self.hover = k
         if k is not None:
             c = self.cards[k]
-            if not c["na"]:
-                self._paint(k, True)
-                self.canvas.configure(cursor="hand2")
-            else:
+            if c["na"]:
                 self.canvas.configure(cursor="arrow")
                 self.lbl_hint.configure(text="TV 键实测不走蓝牙（红外直发），改不了")
+            elif c.get("lock"):
+                self.canvas.configure(cursor="arrow")
+                self.lbl_hint.configure(
+                    text="语音直出已开启，麦克风键已锁定；取消勾选后恢复原绑定")
+            else:
+                self._paint(k, True)
+                self.canvas.configure(cursor="hand2")
         else:
             self.canvas.configure(cursor="")
             self.lbl_hint.configure(text="")
@@ -1275,6 +1952,11 @@ class App(tk.Tk):
                                 "实测是红外直发（电视控制区），蓝牙里没有这个键。\n\n"
                                 "所以它没法映射到电脑上的任何动作。")
             return
+        if c.get("lock"):
+            # 勾了"语音键录音并直接输出文字"：禁止改键，也禁止弹改键小窗
+            self.lbl_hint.configure(
+                text="语音直出已开启，麦克风键已锁定；取消勾选后恢复原绑定")
+            return
         kid = c["kid"]
         Recorder(self, "改键：%s" % c["label"], self.bindings.get(kid), 
                  lambda t, ks, n: self._apply(kid, t, ks, n))
@@ -1283,10 +1965,48 @@ class App(tk.Tk):
         c = self.cards[k]
         if c["na"]:
             return
+        if c.get("lock"):
+            self._paint_lock(c)
+            return
         self.canvas.itemconfigure(c["rect"], fill=(CARD_HOVER if hot else CARD),
                                   outline=(BORDER_HOT if (hot or c["kid"] in self.changed) else BORDER),
                                   width=(2 if (hot or c["kid"] in self.changed) else 1))
         self.canvas.itemconfigure(c["line"], fill=(LEAD_HOT if hot else LEAD))
+
+    def _paint_lock(self, c):
+        """锁定态：整块置灰，看起来就是"点不了"。"""
+        canvas = self.canvas
+        canvas.itemconfigure(c["rect"], fill=CARD_LOCK, outline=BORDER_NA, width=1)
+        canvas.itemconfigure(c["name"], fill=BORDER_NA)
+        canvas.itemconfigure(c["value"], fill=BORDER_NA)
+        canvas.itemconfigure(c["line"], fill=BORDER_NA)
+        if c.get("dot"):
+            canvas.itemconfigure(c["dot"], fill=BORDER_NA)
+
+    def _paint_unlock(self, c):
+        """解除锁定：颜色还原。"""
+        canvas = self.canvas
+        canvas.itemconfigure(c["rect"], fill=CARD, outline=BORDER, width=1)
+        canvas.itemconfigure(c["name"], fill=TEXT_DIM)
+        canvas.itemconfigure(c["value"], fill=TEXT)
+        canvas.itemconfigure(c["line"], fill=LEAD)
+        if c.get("dot"):
+            canvas.itemconfigure(c["dot"], fill=LEAD)
+
+    def _sync_asr_lock(self):
+        """语音直出开着 -> 锁死麦克风键；关掉 -> 还原原绑定功能。"""
+        c = self.cards.get(MIC_KID)
+        if not c:
+            return
+        c["lock"] = bool(self.asr_on)
+        if c["lock"]:
+            self._paint_lock(c)
+        else:
+            self._paint_unlock(c)
+        self._refresh_card(MIC_KID)
+        # 鼠标正停在这块上时，光标也要跟着变
+        if self.hover == MIC_KID:
+            self.canvas.configure(cursor=("arrow" if c["lock"] else "hand2"))
 
     # ------------------------------------------------------------- 串口 --
     def refresh_ports(self):
@@ -1354,7 +2074,12 @@ class App(tk.Tk):
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                self.rx_q.put(line.decode("utf-8", "replace").strip("\r"))
+                s = line.decode("utf-8", "replace").strip("\r")
+                # 音频行走旁路：每秒上百条，塞 UI 队列会把界面拖死
+                if s.startswith("A "):
+                    self._on_audio_line(s)
+                else:
+                    self.rx_q.put(s)
 
     def send(self, cmd):
         if self.ser is None:
@@ -1407,6 +2132,9 @@ class App(tk.Tk):
             self.canvas.itemconfigure(c["value"], text="红外键")
             return
         self.canvas.itemconfigure(c["value"], text=self._card_value(c["label"]))
+        if c.get("lock"):
+            self._paint_lock(c)
+            return
         hot = c["kid"] in self.changed
         self.canvas.itemconfigure(c["rect"],
                                   outline=(BORDER_HOT if hot else BORDER),
@@ -1515,7 +2243,71 @@ class App(tk.Tk):
         self.after(400, lambda: self.cmd_list(True))
 
 
+def write_diag():
+    """--diag：把运行环境自检写到程序目录 diag.txt。
+
+    换台电脑跑不起来时，让用户双击带 --diag 的快捷方式，把 diag.txt 发回来
+    就能定位是缺 DLL、缺模型还是缺解码器，不用猜。
+    """
+    lines = ["CMCC_RC_Keys 环境自检", "=" * 40]
+    lines.append("python      : %s" % sys.version.split()[0])
+    lines.append("frozen      : %s" % bool(getattr(sys, "frozen", False)))
+    lines.append("exe         : %s" % sys.executable)
+    lines.append("_MEIPASS    : %s" % getattr(sys, "_MEIPASS", "-"))
+    lines.append("cwd         : %s" % os.getcwd())
+    lines.append("")
+    lines.append("pyserial    : %s" % ("OK" if serial is not None else "MISSING"))
+    lines.append("bg.png      : %s" % (App._asset("bg.png") or "MISSING"))
+    lines.append("ini         : %s" % ini_path())
+    lines.append("")
+    if asr_win is None:
+        lines.append("asr_win     : IMPORT FAILED - %s" % _ASR_IMPORT_ERR)
+    else:
+        lines.append("asr_win     : OK")
+        for r in asr_win.search_roots():
+            lines.append("  root      : %s" % r)
+        lines.append("  decoder   : %s" % (asr_win.find_decoder() or "MISSING"))
+        md = asr_win.default_model_dir()
+        lines.append("  model dir : %s" % (md or "MISSING"))
+        if md:
+            for f in ("model.int8.onnx", "tokens.txt"):
+                p = os.path.join(md, f)
+                lines.append("    %-18s %s" % (f, "OK" if os.path.exists(p) else "MISSING"))
+        try:
+            eng = asr_win.AsrEngine()
+            eng.load()
+            lines.append("  engine    : load OK (%d ms)" % eng.load_ms)
+            lines.append("  timeout   : %.0f s（卡住就放弃这一句并重建识别器）"
+                         % (ASR_TIMEOUT_MS / 1000.0))
+            import numpy as np
+            t = eng.transcribe(np.zeros(16000, dtype="float32"))
+            lines.append("  selftest  : ran, text=%r" % t)
+        except Exception as exc:
+            lines.append("  engine    : FAIL - %s" % exc)
+    text = "\n".join(lines)
+    dst = os.path.join(app_dir(), "diag.txt")
+    try:
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        dst = os.path.join(os.environ.get("TEMP", "."), "diag.txt")
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    try:
+        print(text)
+    except Exception:
+        pass
+    return dst
+
+
 def main():
+    if "--diag" in sys.argv:
+        p = write_diag()
+        try:
+            messagebox.showinfo("自检完成", "环境自检结果已写入：\n%s" % p)
+        except Exception:
+            pass
+        return
     # 提权助手模式：只临时关掉锁屏，等主程序关弹窗后还原，不碰界面
     if LOCK_HELPER_ARG in sys.argv:
         sys.exit(run_lock_helper())

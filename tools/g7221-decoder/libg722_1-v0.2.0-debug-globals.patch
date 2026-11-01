@@ -1,0 +1,22 @@
+diff --git a/src/decoder.c b/src/decoder.c
+index f1db32f..477f7b2 100644
+--- a/src/decoder.c
++++ b/src/decoder.c
+@@ -51,6 +51,8 @@ int16_t get_rand(g722_1_rand_t *randobj)
+ 
+ #if defined(G722_1_USE_FIXED_POINT)
+ 
++extern int G722_DBG_ERR;
++extern int G722_DBG_BITSLEFT;
+ static void test_for_frame_errors(g722_1_decode_state_t *s,
+                                   int16_t number_of_regions,
+                                   int16_t num_categorization_control_possibilities,
+@@ -546,6 +548,8 @@ static void test_for_frame_errors(g722_1_decode_state_t *s,
+             break;
+         }
+     }
++    G722_DBG_ERR = *frame_error_flag;
++    G722_DBG_BITSLEFT = s->number_of_bits_left;
+ }
+ /*- End of function --------------------------------------------------------*/
+ 

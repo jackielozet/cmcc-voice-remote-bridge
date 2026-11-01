@@ -19,7 +19,7 @@ from PIL import ImageGrab
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
-TITLE = "CMCC 遥控器 - 按键映射"
+TITLE = "CMCC 遥控器 - 按键映射"      # 前缀匹配，标题后面带版本号也能找到
 
 name = sys.argv[1] if len(sys.argv) > 1 else "shot"
 wait = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
@@ -30,7 +30,24 @@ user32 = ctypes.windll.user32
 
 def find_window():
     hwnd = user32.FindWindowW(None, TITLE)
-    return hwnd or None
+    if hwnd:
+        return hwnd
+    # 标题带了版本号，精确匹配会失手，退回按前缀找
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _cb(h, _lp):
+        n = user32.GetWindowTextLengthW(h)
+        if n:
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(h, buf, n + 1)
+            if buf.value.startswith(TITLE):
+                found.append(h)
+                return False
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return found[0] if found else None
 
 
 def rect_of(hwnd):
@@ -41,7 +58,12 @@ def rect_of(hwnd):
 
 def main():
     os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
-    p = subprocess.Popen([PY, os.path.join(HERE, "remote_ui.py")], cwd=HERE)
+    # 设了 CMCC_EXE 就拍打包好的 exe（验证发布产物），否则直接跑源码
+    exe = os.environ.get("CMCC_EXE")
+    if exe:
+        p = subprocess.Popen([exe], cwd=os.path.dirname(exe))
+    else:
+        p = subprocess.Popen([PY, os.path.join(HERE, "remote_ui.py")], cwd=HERE)
     try:
         time.sleep(wait)
         hwnd = find_window()
