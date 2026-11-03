@@ -19,10 +19,15 @@ import sys
 import tempfile
 import threading
 import time
+import re
+import json
+import subprocess
+import shutil
 import tkinter as tk
 import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import messagebox
+from tkinter import filedialog
 
 try:
     import winreg
@@ -101,9 +106,17 @@ def init_metrics():
 
 init_metrics()
 
+SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
-APP_VER = "1.2.0"
+
+APP_VER = "1.3.0"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
+
+# 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
+# 加版本时只往这里加一行，界面不用改。
+APP_VER_LOG = [
+    "20261104：v1.3.0-重构UI",
+]
 
 # 窗口最小客户区高度：按 768 高的屏幕算（768 - 任务栏 - 标题栏 ≈ 690）。
 # 再往下拖，字和框就挤成一团了，干脆锁死。
@@ -626,6 +639,48 @@ def ini_path():
     return os.path.join(app_dir(), INI_NAME)
 
 
+# ------------------------------------------------- 串口身份记忆（分级判定用）--
+# 为什么单独一个文件：remotekey.ini 是「键名 = 动作」的行式映射表，
+# 往里塞串口会把手改过的映射表搞乱，所以另存一份小的 json。
+# 记的是**芯片序列号**（跟芯片走、不跟 USB 口走），换 USB 口也认得出同一块板。
+PORT_PREF_NAME = "bridge_port.json"
+
+
+def port_pref_path():
+    return os.path.join(app_dir(), PORT_PREF_NAME)
+
+
+def read_port_pref():
+    try:
+        with open(port_pref_path(), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_port_pref(ser=None, port=None, desc=None):
+    d = read_port_pref()
+    if ser:
+        d["ser"] = ser
+    if port:
+        d["port"] = port
+    if desc:
+        d["desc"] = desc
+    try:
+        with open(port_pref_path(), "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return d
+
+
+def com_num(dev):
+    """COM11 -> 11。用于按数字排序，别用字符串排（"COM6" > "COM11"）。"""
+    m = re.search(r"(\d+)", dev or "")
+    return int(m.group(1)) if m else 0
+
+
 def key_usage(name):
     """动作名 -> HID usage"""
     if name in KEY_USAGE:
@@ -767,9 +822,140 @@ def default_items():
     return out
 
 
+# ------------------------------------------------------- 硬件信息字段释义 --
+# 这些文案来自固件源码（不是在猜），硬件信息页每个字段旁的「?」
+# 和鼠标悬停提示都读这张表。改文案只改这里。
+HW_TIPS = {
+    "mac":  "桥锁定的目标遥控器蓝牙地址（固件内部叫 pin，写在 NVS 里，一旦认定就不再重新搜索）。\n"
+            "TARGET 行里的 cand/score/why 是它扫描时的候选与打分依据。",
+    "cand": "本轮扫描选中的候选地址。全是 0 表示当前没在扫描、或者没选到。",
+    "batt": "遥控器上报的电池电量百分比。\n读不到时会显示 -1 或空白，通常因为链路还没加密、或者根本没连上。",
+    "conn": "BLE 链路是否已建立。桥连不上时这一项是「未连接」，其余指纹大多也会缺失。",
+    "frames": "累计收到的 0xFC 音频通知条数，每条 20 字节。\n423 条 ≈ 141 帧音频 ≈ 2.8 秒。这个计数只要收到帧就涨，与「是否转储」无关。",
+    "dropped": "序号跳变而被丢弃的帧数。0 表示一帧没丢。",
+    "voice": "当前是否正在收语音：超过 300ms 没有新帧就判为「否」。",
+    "reports": "解析出的 HID 输入报告（对应 GATT 特征）数量。音频、按键、鼠标各占一条。",
+    "itvl": "连接间隔。单位 1.25ms，itvl=24 → 24×1.25 = 30ms。\n这是控制器回报的实际生效值，不是上位机请求的值（PC 上根本改不了连接间隔）。",
+    "lat":  "从机延迟（Slave Latency）：遥控器允许连续跳过这么多个连接事件不回包。\nlat=50 时空闲状态大约 1.5 秒才握手一次 —— 这就是按键要先「戳」一下才醒的原因。",
+    "to":   "监督超时。单位 10ms，to=500 → 5000ms。超过这么久收不到包就判定断链。",
+    "mtu":  "ATT 有效载荷上限，247 字节。\n而音频通知只有 20 字节 —— 说明 20 字节是厂商固件写死的切片长度，不是 ATT 分片的结果。",
+    "dle":  "数据长度扩展（DLE）协商结果，单包最多 251 字节。\n括号里是固件提示：Arduino 核心把本机 RX 锁在 27，所以这行只证明「协商到了」，不代表整条链路真用满了。",
+    "fw_name": "固件自己上报的构建名（OK INFO 里的 name=）。\n这是判断「烧的是哪一版」唯一可靠的依据 —— ESP 镜像里的 app descriptor 在 Arduino 构建下恒为 arduino-lib-builder + git hash，从 bin 反推不出来。",
+    "ver":  "映射表的协议版本，上位机据此决定怎么解析按键映射。\n注意：这个不是固件版本号。",
+    "binds": "已绑定的按键数量。",
+    "learn": "学习模式：只上报按键 id、不执行任何动作，用来录键。",
+    "enabled": "桥的输出总开关。关掉时收到按键也不发，只回协议行，方便静默调试。",
+    "dirty": "有改动还没写进 NVS 的标志。",
+    "audio": "0xFC 音频转储开关。关着时串口上看不到 A 开头的音频行，但 STAT 里的 frames 仍会照常计数 —— 收到帧和转储出来是两件事。",
+    "rid":  "HID Report ID 清单。0x01 键盘、0x02 鼠标、0x03 消费者控制（音量/媒体）、\n0xFC 音频裸管道、0xF8 语音键按下/抬起事件。",
+    "role": "固件给每个报告判的用途：1=键盘 2=消费者 3=数据通道（不订阅）0=未识别。\n判据是 usage page 加报告长度；0xFB/0xF9/0xF8 都是 255 字节的伪装 Consumer 裸管道。",
+    "scan": "扫描详单开关。置 1 会把扫到的每个广播都逐条打出来，排查「为什么没找到遥控器」时用。",
+    "mapd": "Report Map 原文（224 字节）以及从中解析出的报告结构。\n它只说明「有哪些报告、各多少字节」，不含任何音频编码参数。",
+}
+
+
+class HoverTip:
+    """轻量悬浮提示：鼠标停留 350ms 弹出，单击立刻弹出（3 秒后自动收起）。
+
+    Tk 没有原生 tooltip，这里用无边框 Toplevel 手工摆位，
+    并且夹在屏幕内，避免贴着窗口边缘时弹到屏幕外看不见。
+    """
+
+    _active = None
+
+    def __init__(self, widget, text, delay=350):
+        self.w = widget
+        self.text = text
+        self.delay = delay
+        self._job = None
+        self._tip = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<Button-1>", self._on_click, add="+")
+
+    def _on_enter(self, _e=None):
+        self._cancel()
+        try:
+            self._job = self.w.after(self.delay, self.show)
+        except Exception:
+            pass
+
+    def _on_leave(self, _e=None):
+        self._cancel()
+        self.hide()
+
+    def _on_click(self, _e=None):
+        self._cancel()
+        self.show()
+        try:
+            self._job = self.w.after(3000, self.hide)
+        except Exception:
+            pass
+
+    def show(self):
+        self._job = None
+        if self._tip is not None or not self.text:
+            return
+        HoverTip.hide_all()
+        try:
+            x = self.w.winfo_rootx()
+            y = self.w.winfo_rooty() + self.w.winfo_height() + zp(4)
+            sw = self.w.winfo_screenwidth()
+            sh = self.w.winfo_screenheight()
+        except Exception:
+            return
+        tip = tk.Toplevel(self.w)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except Exception:
+            pass
+        tip.configure(bg=BORDER)
+        tk.Label(tip, text=self.text, bg="#fffdf2", fg=TEXT, justify="left",
+                 anchor="w", font=("Microsoft YaHei UI", zp(9)),
+                 wraplength=zp(340), padx=zp(9), pady=zp(7)).pack(padx=1, pady=1)
+        tip.update_idletasks()
+        w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        if x + w > sw - zp(6):
+            x = max(zp(6), sw - w - zp(6))
+        if y + h > sh - zp(6):                      # 下方放不下就翻到上面
+            y = self.w.winfo_rooty() - h - zp(4)
+        tip.geometry("+%d+%d" % (x, y))
+        self._tip = tip
+        HoverTip._active = self
+
+    def hide(self):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+        if HoverTip._active is self:
+            HoverTip._active = None
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.w.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    @classmethod
+    def hide_all(cls):
+        if cls._active is not None:
+            cls._active.hide()
+
+
 # ------------------------------------------------------------------- 录键 --
 class Recorder(tk.Toplevel):
-    """点文本框后弹出：直接按下目标键（可组合），或从列表里挑"""
+    """点文本框后弹出：直接按下目标键。
+
+    支持两种绑定：
+      · 单独绑定修饰键：单击 Ctrl / Shift / Alt / Win 即可（按下后松开即生效）
+      · 组合键：按住 Ctrl / Shift / Alt / Win 再按主键（如 Ctrl+C、Win+L）
+    """
 
     def __init__(self, master, title, cur, on_ok):
         super().__init__(master)
@@ -781,6 +967,8 @@ class Recorder(tk.Toplevel):
         self.on_ok = on_ok
         self.result = None
         self.mods = set()
+        self._cycle_mods = set()      # 本次按压周期里按下的所有修饰键
+        self._plain_committed = False  # 本周期是否已绑定过主键（组合键）
 
         wrap = tk.Frame(self, bg=BG, padx=zp(22), pady=zp(16))
         wrap.pack(fill="both", expand=True)
@@ -799,7 +987,7 @@ class Recorder(tk.Toplevel):
         self.lbl_rec = tk.Label(box, text="等待按键…", bg=PANEL, fg=ACCENT,
                                 font=("Microsoft YaHei UI", zp(20), "bold"))
         self.lbl_rec.pack(pady=(0, zp(4)))
-        self.lbl_tip = tk.Label(box, text="支持组合键：按住 Ctrl / Shift / Alt / Win 再按主键",
+        self.lbl_tip = tk.Label(box, text="可单独绑定 Ctrl/Shift/Alt/Win（按下松开即生效），也可组合主键如 Ctrl+C、Win+L",
                                 bg=PANEL, fg=TEXT_DIM, font=("Microsoft YaHei UI", zp(8)))
         self.lbl_tip.pack(pady=(0, zp(2)))
         self.lbl_shield = tk.Label(box, text="", bg=PANEL, fg=TEXT_DIM,
@@ -819,21 +1007,6 @@ class Recorder(tk.Toplevel):
                       relief="flat", borderwidth=0,
                       font=("Microsoft YaHei UI", zp(8))).pack(side="left",
                                                                padx=zp(3), ipady=zp(1))
-
-        tk.Label(wrap, text="或者从常用动作里选", bg=BG, fg=TEXT_DIM,
-                 font=("Microsoft YaHei UI", zp(9))).pack(anchor="w", pady=(zp(12), zp(4)))
-
-        pick = tk.Frame(wrap, bg=BG)
-        pick.pack(fill="x")
-        self.cbo = tk.StringVar(value="—")
-        opts = ["—", "不响应"] + list(MEDIA_NAME.values()) + list(KEY_NAME.values())
-        self.om = tk.OptionMenu(pick, self.cbo, *opts, command=self._pick)
-        self.om.configure(bg=PANEL, fg=TEXT, activebackground=CARD_HOVER,
-                          activeforeground=TEXT, highlightthickness=zp(1),
-                          highlightbackground=BORDER, borderwidth=0,
-                          font=("Microsoft YaHei UI", zp(9)), width=20, anchor="w")
-        self.om["menu"].configure(bg="#ffffff", fg=TEXT, font=("Microsoft YaHei UI", zp(9)))
-        self.om.pack(side="left")
 
         bar = tk.Frame(wrap, bg=BG)
         bar.pack(fill="x", pady=(zp(16), 0))
@@ -885,7 +1058,6 @@ class Recorder(tk.Toplevel):
             return
         self.result = r
         self.lbl_rec.configure(text=describe(*r))
-        self.cbo.set("—")
 
     def _helper_cmd(self):
         """提权起助手：打包成 exe 就重启自己，跑脚本就找 pythonw"""
@@ -961,6 +1133,10 @@ class Recorder(tk.Toplevel):
     def _vk_down(self, vk):
         mod = VK_MOD.get(vk)
         if mod is not None:
+            if not self.mods:
+                self._cycle_mods = set()
+                self._plain_committed = False
+            self._cycle_mods.add(mod)
             self.mods.add(mod)
             self._show_pending()
             return
@@ -972,7 +1148,7 @@ class Recorder(tk.Toplevel):
     def _vk_up(self, vk):
         mod = VK_MOD.get(vk)
         if mod is not None:
-            self.mods.discard(mod)
+            self._on_mod_release(mod)
 
     def destroy(self):
         try:
@@ -1015,11 +1191,18 @@ class Recorder(tk.Toplevel):
     def _press(self, ev):
         ks = ev.keysym
         if ks in MODIFIER_KEYSYMS:
-            if ks.startswith("Control"): self.mods.add(MOD_CTRL)
-            elif ks.startswith("Shift"): self.mods.add(MOD_SHIFT)
-            elif ks.startswith("Alt"):   self.mods.add(MOD_ALT)
-            elif ks.startswith(("Super", "Win")): self.mods.add(MOD_WIN)
-            self._show_pending()
+            if ks.startswith("Control"): m = MOD_CTRL
+            elif ks.startswith("Shift"): m = MOD_SHIFT
+            elif ks.startswith("Alt"):   m = MOD_ALT
+            elif ks.startswith(("Super", "Win")): m = MOD_WIN
+            else: m = None
+            if m is not None:
+                if not self.mods:
+                    self._cycle_mods = set()
+                    self._plain_committed = False
+                self._cycle_mods.add(m)
+                self.mods.add(m)
+                self._show_pending()
             return
 
         usage, need_shift = self._lookup(ks, ev)
@@ -1032,10 +1215,20 @@ class Recorder(tk.Toplevel):
 
     def _release(self, ev):
         ks = ev.keysym
-        if ks.startswith("Control"): self.mods.discard(MOD_CTRL)
-        elif ks.startswith("Shift"): self.mods.discard(MOD_SHIFT)
-        elif ks.startswith("Alt"):   self.mods.discard(MOD_ALT)
-        elif ks.startswith(("Super", "Win")): self.mods.discard(MOD_WIN)
+        if ks.startswith("Control"): self._on_mod_release(MOD_CTRL)
+        elif ks.startswith("Shift"): self._on_mod_release(MOD_SHIFT)
+        elif ks.startswith("Alt"):   self._on_mod_release(MOD_ALT)
+        elif ks.startswith(("Super", "Win")): self._on_mod_release(MOD_WIN)
+
+    def _on_mod_release(self, mod):
+        """修饰键松开：若这组修饰键是单独按下的（没跟主键），就单独绑定它。"""
+        self.mods.discard(mod)
+        if self.mods or self._plain_committed:
+            return
+        keys = sorted(self._cycle_mods)
+        self._cycle_mods = set()
+        if keys:
+            self._commit(keys, "keyboard")
 
     def _lookup(self, ks, ev):
         if len(ks) == 1:
@@ -1061,35 +1254,15 @@ class Recorder(tk.Toplevel):
         self.lbl_rec.configure(text="+".join(names + ["…"]) if names else "等待按键…")
 
     def _commit(self, keys, source):
+        self._plain_committed = True
         n = min(len(keys), 4)
         keys = (keys + [0, 0, 0, 0])[:4]
         self.result = (1, keys, n)
         self.lbl_rec.configure(text=describe(1, keys, n))
-        self.cbo.set("—")
-
-    # ---- 下拉选择 ----
-    def _pick(self, sel):
-        """下拉里选了动作：立刻把录键区显示成它，不然用户以为没选上"""
-        sel = (sel or "").strip()
-        if not sel or sel == "—":
-            return
-        r = parse_action(sel)
-        if r is None:
-            self.lbl_rec.configure(text="无法识别：" + sel)
-            return
-        self.result = r
-        self.lbl_rec.configure(text=describe(*r) or "不响应")
 
     def _ok(self):
-        # 下拉里的名字有键盘键（Esc/F5/回车）、多媒体键（音量 +）、还有"不响应"，
-        # 统一交给 parse_action 解析，避免两边表不一致导致选完却存不进去。
-        sel = self.cbo.get().strip()
-        if sel and sel != "—":
-            r = parse_action(sel)
-            if r is not None:
-                self.result = r
         if self.result is None:
-            messagebox.showinfo("提示", "还没录到按键。先在键盘上按一个，或从下拉里选。", parent=self)
+            messagebox.showinfo("提示", "还没录到按键。先在键盘上按一个组合键，或单独按 Ctrl/Shift/Alt/Win。", parent=self)
             return
         out_type, keys, n = self.result
         self.destroy()
@@ -1166,7 +1339,10 @@ class App(tk.Tk):
         LockGuard.restore_stale()   # 上次被强杀留下的"禁锁屏"痕迹，先还原
 
         self.ser = None
+        self._port_user_locked = False   # 用户手改过串口 -> 扫端口不再覆盖
+        self._probing = False            # 后台握手中，避免重复开线程
         self.rx_q = queue.Queue()
+        self.ui_q = queue.Queue()   # 子线程 -> 主线程的 UI 任务队列
         self.bindings = {}          # 设备当前值 id -> dict(out_type, keys, n)
         self.ini = {}               # 配置源 键名 -> (out_type, keys, n)
         self.changed = set()        # 本次改过的 id
@@ -1182,6 +1358,10 @@ class App(tk.Tk):
 
         # ---- 语音转文字状态 ----
         self.asr_on = False
+        self.var_asr = tk.BooleanVar(value=False)   # 语音方案页的勾选框（提前建好，避免未访问即触发）
+        self._cap = []              # 硬件信息页抓取时的临时缓冲
+        self._cap_active = False
+        self._flash_running = False
         self.asr_engine = None      # asr_win.AsrEngine
         self.asr_hook = None        # 吞掉语音键组合的钩子
         self.asr_framer = None
@@ -1197,19 +1377,39 @@ class App(tk.Tk):
         self.asr_timeouts = 0       # 熔断过几次（诊断用）
 
         self._fit_z_to_screen()
-        self._build(fix_size=True)
-        self._set_size_limits()
+        self._build_shell()
+        self._build_pages()
+        self._show_page(0)
         self._load_ini()
         self.refresh_ports()
         self._drain()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda e: self.destroy())
+        # 左侧栏翻页：上/下方向键循环切换（焦点在输入框/文本框时不抢键）
+        self.bind("<Up>", lambda e: self._page_step(-1))
+        self.bind("<Down>", lambda e: self._page_step(+1))
+        # 初始窗口尺寸 = 缩放基准；之后拖拽按高度比例重算 Z 并重建界面（内容等比缩放）
+        sw = SIDEBAR_W + WIN_W + zp(20)
+        sh = WIN_H + zp(170)
+        self.geometry("%dx%d" % (sw, sh))
+        self.resizable(True, True)
+        # 锁住宽高比（和旧版一致）：这样拖任意一条边都只改大小、不改形状，
+        # 内容才能干净地等比缩放，不会被拉扁。
+        try:
+            self.wm_aspect(sw, sh, sw, sh)
+        except Exception:
+            pass
+        self.update_idletasks()
+        self._base_wh = (sw, sh)
+        self._base_z = Z
+        self._cur_k = 1.0
+        self._pending_k = 1.0
         self.bind("<Configure>", self._on_configure)
 
     # --------------------------------------------------------- 等比缩放 --
     def _fit_z_to_screen(self):
         """启动时按屏幕可用高度收 Z：换到 1080p 小屏也不会开在屏幕外面。"""
-        global Z
+        global Z, SIDEBAR_W
         try:
             sh = self.winfo_screenheight()
         except Exception:
@@ -1221,6 +1421,7 @@ class App(tk.Tk):
         if est > avail > 0:
             Z = Z * (avail / est)
             init_metrics()
+            SIDEBAR_W = zp(140)            # 侧栏宽按收过的 Z 重算，别用 import 时的旧值
 
     def _set_size_limits(self):
         """限制可拖范围。
@@ -1286,48 +1487,142 @@ class App(tk.Tk):
         self._apply_scale(k)
 
     def _apply_scale(self, k):
-        """按 k 重算全部尺寸并重建界面。串口连接 / 配置 / 勾选状态都保留。"""
-        global Z
+        """按 k 重算全部尺寸并重建界面（左侧栏 + 四页结构）。
+
+        为什么要整个重建：tk 的字号是创建时定死的，改不了；只能按新 Z 重新量一遍。
+        「状态」由 _snapshot_ui/_restore_ui 搬过去——串口连接、端口、当前页、
+        日志内容、语音勾选、固件路径都保留，用户感觉只是窗口变大变小了。
+        """
+        global Z, SIDEBAR_W
+        if self._building:
+            return
         self._building = True
         try:
-            port = self.cbo_port.get().strip()
-            status = self.lbl_status.cget("text")
-            conn_txt = self.btn_conn.cget("text")
-            dirty = self.lbl_dirty.cget("text")
-            hint = self.lbl_hint.cget("text")
-            asr_on = self.var_asr.get()
-            asr_txt = self.lbl_asr.cget("text")
-            asr_fg = self.lbl_asr.cget("fg")
-
+            HoverTip.hide_all()          # 重建前先收起悬浮提示，别留个孤儿窗口
+            st = self._snapshot_ui()
             Z = self._base_z * k
             init_metrics()
+            SIDEBAR_W = zp(140)          # 侧栏宽度也跟着等比走
             self._cur_k = k
 
             for w in self.winfo_children():
                 w.destroy()
+            self.pages = [None] * len(self.nav_spec)
+            self.nav_btns = []
             self.cards.clear()
             self.hover = None
-            self._build(fix_size=False)
 
-            self.cbo_port.delete(0, "end")
-            if port:
-                self.cbo_port.insert(0, port)
-            self.lbl_status.configure(
-                text=status, fg=(ACCENT if self.ser is not None else "#c9553f"))
-            self.btn_conn.configure(text=conn_txt)
-            self.lbl_hint.configure(text=hint)
-            self.var_asr.set(asr_on)
-            # 没勾选就换成这次按新字宽挑的那条说明，别把旧的长句塞回去
-            self.lbl_asr.configure(
-                text=(asr_txt if asr_on else self._off_note), fg=asr_fg)
-            self._refresh_all()
-            self._mark_dirty()
-            self._sync_asr_lock()      # 重建后勾选状态要跟着恢复锁定
-            self.lbl_dirty.configure(text=dirty)
+            self._build_shell()
+            self._build_pages()
+            self._show_page(int(st.get("page", 0)) % max(1, len(self.nav_spec)))
+            self._restore_ui(st)
         except Exception:
             pass
         finally:
             self.after(80, self._end_building)
+
+    # ---- 重建时的状态搬运 ----
+    def _snapshot_ui(self):
+        d = {"page": getattr(self, "_cur_page", 0)}
+
+        def entry_text(attr):
+            w = getattr(self, attr, None)
+            try:
+                return w.get()
+            except Exception:
+                return ""
+
+        def box_text(attr):
+            w = getattr(self, attr, None)
+            try:
+                return w.get("1.0", "end-1c")
+            except Exception:
+                return None
+
+        def label_text(attr):
+            w = getattr(self, attr, None)
+            try:
+                return w.cget("text")
+            except Exception:
+                return None
+
+        d["port"] = entry_text("cbo_port")
+        d["status"] = label_text("lbl_status")
+        d["conn"] = label_text("btn_conn")
+        d["fw"] = entry_text("flash_fw")
+        d["log"] = box_text("flash_log")
+        d["voice"] = box_text("voice_box")
+        for key, attr in (("baud", "flash_baud"), ("autoscroll", "flash_autoscroll"),
+                          ("wrap", "flash_wrap")):
+            v = getattr(self, attr, None)
+            try:
+                d[key] = v.get()
+            except Exception:
+                pass
+        try:
+            d["asr"] = bool(self.var_asr.get())
+        except Exception:
+            pass
+        return d
+
+    def _restore_ui(self, d):
+        try:
+            if d.get("port"):
+                self.cbo_port.delete(0, "end")
+                self.cbo_port.insert(0, d["port"])
+            if d.get("status"):
+                self.lbl_status.configure(
+                    text=d["status"], fg=(ACCENT if self.ser is not None else "#c9553f"))
+            if d.get("conn"):
+                self.btn_conn.configure(text=d["conn"])
+        except Exception:
+            pass
+        # 语音勾选：BigCheck 挂的是同一个 var，trace 会自己重画
+        try:
+            self.var_asr.set(bool(d.get("asr", False)))
+        except Exception:
+            pass
+        # 固件烧录页
+        try:
+            if d.get("fw"):
+                self.flash_fw.delete(0, "end")
+                self.flash_fw.insert(0, d["fw"])
+            # 缩放会整页重建，重建后不能把 esptool 实测的结果退化成「未知」
+            if (getattr(self, "_chip_name", "") and
+                    getattr(self, "_chip_why", "") == "esptool 实测"):
+                self._chip_label(self._chip_name, self._chip_why)
+            else:
+                self._update_chip()
+        except Exception:
+            pass
+        for key, attr in (("baud", "flash_baud"), ("autoscroll", "flash_autoscroll"),
+                          ("wrap", "flash_wrap")):
+            v = getattr(self, attr, None)
+            if v is not None and key in d:
+                try:
+                    v.set(d[key])
+                except Exception:
+                    pass
+        try:
+            self._flash_toggle_wrap()
+        except Exception:
+            pass
+        # 日志 / 语音文本框（两者都是 disabled 态，写前要临时解锁）
+        for txt, attr in ((d.get("log"), "flash_log"), (d.get("voice"), "voice_box")):
+            if not txt:
+                continue
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+                w.insert("end", txt)
+                w.configure(state="disabled")
+                if attr == "flash_log":
+                    self._flash_n = txt.count("\n")
+            except Exception:
+                pass
 
     def _end_building(self):
         self._building = False
@@ -1598,7 +1893,15 @@ class App(tk.Tk):
         if not text:
             self._asr_status("● 没识别出文字（%.1fs 音频，可能没收到声音）" % dur, WARN)
             return
-        ok = asr_win.inject_text(text)
+        # 语音转文字测试框：无论是否聚焦都记录识别结果
+        self._voice_print(text)
+        # 若测试框当前被聚焦，就只在框里显示，不再向系统注入（避免重复上屏）
+        try:
+            box_focused = (getattr(self, "voice_box", None) is not None
+                           and str(self.voice_box) == str(self.focus_get()))
+        except Exception:
+            box_focused = False
+        ok = True if box_focused else asr_win.inject_text(text)
         self.asr_count += 1
         short = text if len(text) <= 20 else text[:20] + "…"
         self._asr_status("● 已输入 %d 字：%s（%.1fs 音频 / %dms）%s" %
@@ -1687,17 +1990,21 @@ class App(tk.Tk):
         ot, keys, n = r
         return describe(ot, keys, n)
 
-    def _build(self, fix_size=False):
+    # ----------------------------------------------------- 侧栏 + 多页框架 --
+    def _build_shell(self):
+        """顶部全局栏（串口/连接/状态，页2/3/4 共用）+ 左侧导航 + 右侧页面容器。"""
+        # 顶部全局栏
         top = tk.Frame(self, bg=BG)
-        top.pack(fill="x", padx=zp(14), pady=(zp(10), zp(4)))
-
+        top.pack(side="top", fill="x", padx=zp(12), pady=(zp(10), zp(6)))
         tk.Label(top, text="串口", bg=BG, fg=TEXT_DIM,
                  font=("Microsoft YaHei UI", zp(9))).pack(side="left")
         self.cbo_port = tk.Entry(top, width=9, bg=PANEL, fg=TEXT, insertbackground=TEXT,
                                  relief="flat", justify="center",
                                  font=("Consolas", zp(10)))
         self.cbo_port.pack(side="left", padx=(zp(6), zp(6)), ipady=zp(3))
-        tk.Button(top, text="扫端口", command=self.refresh_ports,
+        # 手动改过串口就记为「手选」，后面扫端口不再覆盖用户的选择
+        self.cbo_port.bind("<KeyRelease>", self._on_port_typed)
+        tk.Button(top, text="扫端口", command=lambda: self.refresh_ports(force=True),
                   bg=BTN2, fg=BTN2_FG, relief="flat", activebackground=CARD_HOVER,
                   activeforeground=TEXT, borderwidth=0,
                   font=("Microsoft YaHei UI", zp(9))).pack(side="left")
@@ -1706,51 +2013,487 @@ class App(tk.Tk):
                                   activebackground="#0f8b4c", activeforeground="#ffffff",
                                   font=("Microsoft YaHei UI", zp(9)))
         self.btn_conn.pack(side="left", padx=zp(8))
-
-        self.lbl_status = tk.Label(top, text="未连接", bg=BG, fg="#c0392b",
+        self.lbl_status = tk.Label(top, text="未连接", bg=BG, fg="#c9553f",
                                    font=("Microsoft YaHei UI", zp(9)))
         self.lbl_status.pack(side="left")
-
-        # 右上角版本号：先 pack 的靠最右，钉死在角落，不会被左边的提示文字挤动
-        self.lbl_ver = tk.Label(top, text="v" + APP_VER, bg=BG, fg=TEXT_DIM,
-                                font=("Consolas", zp(9), "bold"))
-        self.lbl_ver.pack(side="right")
-
         self.lbl_hint = tk.Label(top, text="", bg=BG, fg=TEXT_DIM,
                                  font=("Microsoft YaHei UI", zp(9)))
         self.lbl_hint.pack(side="right", padx=(0, zp(10)))
 
-        # ---- 第二行：本地离线语音转文字开关 ----
-        row2 = tk.Frame(self, bg=BG)
-        row2.pack(fill="x", padx=zp(14), pady=(zp(4), 0))
+        # 主体：左栏 + 右侧内容
+        body = tk.Frame(self, bg=BG)
+        body.pack(side="top", fill="both", expand=True)
 
-        self.var_asr = tk.BooleanVar(value=False)
-        self.chk_asr = BigCheck(
-            row2, text="勾选后语音键录音并直接输出文字",
-            var=self.var_asr, command=self.toggle_asr, box=22)
-        self.chk_asr.pack(side="left")
+        self.side = tk.Frame(body, bg=PANEL, width=SIDEBAR_W)
+        self.side.pack(side="left", fill="y")
+        self.side.pack_propagate(False)
+        self.nav_btns = []
+        self.nav_spec = [
+            ("硬件信息", self._page_hardware),
+            ("按键映射", self._page_keys),
+            ("语音方案", self._page_voice),
+            ("固件烧录", self._page_flash),
+        ]
+        for i, (name, _b) in enumerate(self.nav_spec):
+            bw = tk.Button(self.side, text=name, command=lambda idx=i: self._show_page(idx),
+                           bg=(ACCENT if i == 0 else PANEL),
+                           fg=("white" if i == 0 else TEXT),
+                           activebackground=ACCENT, activeforeground="white",
+                           relief="flat", borderwidth=0, anchor="w",
+                           font=("Microsoft YaHei UI", zp(11), "bold"),
+                           padx=zp(14), pady=zp(10))
+            bw.pack(side="top", fill="x")
+            self.nav_btns.append(bw)
+        ver_lbl = tk.Label(self.side, text="CMCC_RC_Keys\nv%s" % APP_VER, bg=PANEL,
+                           fg=TEXT_DIM, font=("Microsoft YaHei UI", zp(8)),
+                           anchor="w", justify="left", cursor="hand2")
+        ver_lbl.pack(side="bottom", fill="x", padx=zp(10), pady=zp(8))
+        # 悬停/单击版本号 → 弹出更新内容（HoverTip 会自己判断下方放不下就翻到上面）
+        self._ver_tip = HoverTip(ver_lbl, "\n".join(APP_VER_LOG))
 
-        # ---- 第三行：说明 / 运行状态（单独占一行，不与勾选框抢宽度）----
-        row3 = tk.Frame(self, bg=BG)
-        row3.pack(fill="x", padx=(zp(14) + zp(22) + zp(8)), pady=(zp(1), 0))
-        self._off_note = self._pick_note(ASR_OFF_NOTES)
-        self.lbl_asr = tk.Label(
-            row3, text=self._off_note, anchor="w",
-            bg=BG, fg=TEXT_DIM, font=("Microsoft YaHei UI", zp(9)))
-        self.lbl_asr.pack(side="left")
+        self.content = tk.Frame(body, bg=BG)
+        self.content.pack(side="left", fill="both", expand=True)
+        self.pages = [None] * len(self.nav_spec)
+        self._cur_page = 0
 
-        area = tk.Frame(self, bg=BG)
+    def _build_pages(self):
+        for i, (_n, builder) in enumerate(self.nav_spec):
+            if self.pages[i] is None:
+                builder()
+
+    def _show_page(self, idx):
+        for i, f in enumerate(self.pages):
+            if f is None:
+                continue
+            if i == idx:
+                f.pack(fill="both", expand=True)
+            else:
+                f.pack_forget()
+        for i, b in enumerate(self.nav_btns):
+            on = (i == idx)
+            b.configure(bg=(ACCENT if on else PANEL), fg=("white" if on else TEXT))
+        self._cur_page = idx
+        # 焦点若还停在被切走那页的输入框/文本框里，这里把焦点收回主窗口。
+        # 否则上下键会被那个已隐藏的 Text 吃掉，表现为「点侧栏后方向键没反应」。
+        self._drop_input_focus()
+        if idx == 0:
+            self._hw_on_show()
+        elif idx == 3 and getattr(self, "flash_port_lbl", None) is not None:
+            self.flash_port_lbl.configure(text=self.cbo_port.get() or "—")
+
+    @staticmethod
+    def _is_input_widget(w):
+        return isinstance(w, (tk.Entry, tk.Text, tk.Listbox, tk.Spinbox))
+
+    def _drop_input_focus(self):
+        """把焦点从输入类控件收回主窗口（只在它确实占着焦点时才动）。"""
+        try:
+            w = self.focus_get()
+        except Exception:
+            return
+        if w is not None and self._is_input_widget(w):
+            try:
+                self.focus_set()
+            except Exception:
+                pass
+
+    def _page_step(self, delta):
+        """上/下方向键在左侧栏四页之间循环切换。
+
+        只有当焦点停在**当前可见**的输入框/文本框里时才不抢键（那里上下键是移光标、
+        滚日志）；隐藏控件或焦点在主窗口时一律响应，避免出现「按了没反应」。
+        """
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+        if self._is_input_widget(w):
+            try:
+                if w.winfo_ismapped():
+                    return None
+            except Exception:
+                return None
+        n = len(getattr(self, "nav_spec", []) or [])
+        if n <= 1 or not getattr(self, "pages", None):
+            return None
+        self._show_page((self._cur_page + delta) % n)
+        return "break"
+
+    # --------------------------------------------------- 页1：硬件信息 ----
+    def _page_hardware(self):
+        if self.pages[0] is not None:
+            return
+        f = tk.Frame(self.content, bg=BG)
+        self.pages[0] = f
+        head = tk.Frame(f, bg=BG, padx=zp(18), pady=zp(14))
+        head.pack(fill="x")
+        tk.Label(head, text="硬件信息", bg=BG, fg=TEXT,
+                 font=("Microsoft YaHei UI", zp(14), "bold")).pack(side="left")
+        tk.Button(head, text="重新抓取（需已连接桥）", command=self._hw_refresh,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))).pack(side="right", ipadx=zp(6), ipady=zp(2))
+
+        # 摘要区：每行若干「字段 值 ?」三连，? 悬停或点击给出该字段含义
+        self.hw_box = tk.Frame(f, bg=PANEL)
+        self.hw_box.pack(fill="x", padx=zp(18), pady=(0, zp(10)))
+        self.hw_grid = tk.Frame(self.hw_box, bg=PANEL)
+        self.hw_grid.pack(anchor="w", padx=zp(12), pady=zp(9))
+
+        rawf = tk.Frame(f, bg=BG, padx=zp(18))
+        rawf.pack(fill="both", expand=True, pady=(0, zp(14)))
+        tk.Label(rawf, text="原始指纹（bridge_info.txt）", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(anchor="w")
+        self.hw_text = tk.Text(rawf, bg="#0f1c16", fg="#c8f0d8", relief="flat",
+                               font=("Consolas", zp(9)), wrap="word", state="disabled",
+                               height=10)
+        self.hw_text.pack(side="left", fill="both", expand=True)
+        scb = tk.Scrollbar(rawf, command=self.hw_text.yview)
+        scb.pack(side="right", fill="y")
+        self.hw_text.configure(yscrollcommand=scb.set)
+        self._hw_load_file()
+
+    def _hw_on_show(self):
+        self._hw_load_file()
+
+    def _hw_load_file(self):
+        p = os.path.join(app_dir(), "bridge_info.txt")
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    self._hw_render(fh.read())
+                return
+            except Exception:
+                pass
+        self._hw_set_message(
+            "尚未抓取设备指纹。\n点右上「重新抓取」前请先用顶部「连接」连上 ESP32 桥。")
+        self.hw_text.configure(state="normal")
+        self.hw_text.delete("1.0", "end")
+        self.hw_text.insert("end", "（暂无 bridge_info.txt）")
+        self.hw_text.configure(state="disabled")
+
+    # ---- 摘要区渲染：一行若干「字段 值 ?」，? 上挂 HW_TIPS ----
+    def _hw_clear_rows(self):
+        try:
+            HoverTip.hide_all()
+            for w in self.hw_grid.winfo_children():
+                w.destroy()
+        except Exception:
+            pass
+
+    def _hw_set_message(self, text):
+        self._hw_clear_rows()
+        try:
+            tk.Label(self.hw_grid, text=text, bg=PANEL, fg=TEXT_DIM, anchor="w",
+                     justify="left", font=("Microsoft YaHei UI", zp(9)),
+                     wraplength=zp(540)).grid(row=0, column=0, sticky="w")
+        except Exception:
+            pass
+
+    def _hw_set_rows(self, rows):
+        """摘要区一律**单列**：每个字段占一行，横向只有「字段 / 值 / ?」三列。
+
+        `rows` 仍是按语义分组传来（MAC+电量+连接 一组…），但这里顺序展平 ——
+        分组只作数据组织，不再并排渲染。原因：并排时一行里只要有一个长值
+        （比如报告映射），grid 的第 1 列就被它撑宽，同一行后面几组字段全被
+        推到窗口外，只能把窗体拉很宽才看得全。
+
+        cell 可以是 3 元组 (字段, 值, 提示键)，也可以是 4 元组
+        (字段, 值, 提示键, True) —— 第 4 位 True 表示值自身带换行、需要多行显示。
+        """
+        self._hw_clear_rows()
+        try:
+            r = 0
+            for cells in rows:
+                for item in cells:
+                    label, value, tip = item[0], item[1], item[2]
+                    multi = len(item) > 3 and bool(item[3])
+                    # 多行值的顶对齐，否则「?」会被拉到整块的垂直中间
+                    anchor = "nw" if multi else "w"
+                    tk.Label(self.hw_grid, text=label, bg=PANEL, fg=TEXT_DIM,
+                             anchor="w", justify="left",
+                             font=("Microsoft YaHei UI", zp(9))
+                             ).grid(row=r, column=0, sticky=anchor,
+                                    padx=(0, zp(8)), pady=zp(1))
+                    # 值 + ? 装进同一个格子里：若把 ? 直接放第 2 列，它会排到
+                    # 「本列最长的那个值」后面，短值的 ? 就被甩到很右边了。
+                    holder = tk.Frame(self.hw_grid, bg=PANEL)
+                    holder.grid(row=r, column=1, sticky=anchor,
+                                padx=(0, zp(6)), pady=zp(1))
+                    tk.Label(holder, text=value, bg=PANEL, fg=TEXT,
+                             anchor="nw", justify="left",
+                             font=("Consolas", zp(9))
+                             ).pack(side="left", anchor="n")
+                    q = tk.Label(holder, text="?", bg=PANEL, fg=BORDER_HOT,
+                                 font=("Microsoft YaHei UI", zp(8), "bold"),
+                                 cursor="hand2", padx=zp(2))
+                    q.pack(side="left", anchor="n", padx=(zp(6), 0))
+                    HoverTip(q, HW_TIPS.get(tip, ""))
+                    r += 1
+        except Exception:
+            pass
+
+    def _hw_render(self, text):
+        info = self.parse_bridge_info(text)
+        rows = []
+
+        def push(*cells):
+            row = [c for c in cells if c]
+            if row:
+                rows.append(row)
+
+        def cell(label, value, tip, multi=False):
+            if value is None or value == "":
+                return None
+            return (label, str(value), tip, multi)
+
+        def flag(v, on="开", off="关"):
+            return None if v is None else (on if v else off)
+
+        b = info.get("batt")
+        push(cell("遥控器 MAC", info.get("mac"), "mac"),
+             cell("电量", ("%d%%" % b) if (b is not None and b >= 0) else None, "batt"),
+             cell("连接", flag(info.get("conn"), "已连接", "未连接"), "conn"))
+        if info.get("cand"):
+            push(cell("扫描候选", info.get("cand"), "cand"),
+                 cell("打分", info.get("score"), "cand"),
+                 cell("依据", info.get("why"), "cand"))
+
+        push(cell("连接间隔", (info["itvl"] + " (%.2fms)" % (int(info["itvl"]) * 1.25))
+                  if info.get("itvl", "").isdigit() else info.get("itvl"), "itvl"),
+             cell("从机延迟", info.get("lat"), "lat"),
+             cell("监督超时", (info["to"] + "0ms") if info.get("to", "").isdigit() else info.get("to"), "to"))
+
+        push(cell("MTU", info.get("mtu"), "mtu"),
+             cell("数据长度扩展", ("%s/%s" % (info["dle_tx"], info["dle_rx"]))
+                  if info.get("dle_tx") and info.get("dle_rx") else None, "dle"))
+
+        push(cell("帧计数", info.get("frames"), "frames"),
+             cell("丢帧", info.get("dropped"), "dropped"),
+             cell("语音中", flag(info.get("voice"), "是", "否"), "voice"),
+             cell("HID 报告数", info.get("rcount"), "reports"),
+             cell("扫描详单", flag(info.get("scan")), "scan"))
+
+        # 固件版本：只认设备自己上报的构建名（OK INFO name=）。
+        # 老固件不上报就老实说没上报，本地镜像名只作参考，不冒充设备真实版本。
+        dev_name = (info.get("ver_name") or "").strip()
+        local_name = self._detect_fw_build_name()
+        if dev_name:
+            push(cell("固件版本", dev_name, "fw_name"))
+        else:
+            extra = ""
+            if info.get("ver") is not None:
+                extra = "协议 ver=%s" % info["ver"]
+            if local_name:
+                extra = (extra + "｜" if extra else "") + "本地镜像 %s" % local_name
+            push(cell("固件版本", "设备未上报构建名（%s）" % (extra or "无"), "fw_name"))
+
+        push(cell("协议版本", info.get("ver"), "ver"),
+             cell("绑定数", info.get("binds"), "binds"),
+             cell("桥使能", flag(info.get("enabled")), "enabled"))
+        push(cell("学习模式", flag(info.get("learn")), "learn"),
+             cell("未保存改动", flag(info.get("dirty"), "有", "无"), "dirty"),
+             cell("音频转储", flag(info.get("audio")), "audio"))
+
+        if info.get("reports"):
+            push(cell("HID 报告", "  ".join(info["reports"]), "rid"))
+        if info.get("map"):
+            # 报告映射条目多（一块板七八个通道），一条一行会占掉太多纵向空间；
+            # 每行 3 条既不会把列撑宽（单列布局下宽度本来就够），又能省行数。
+            lines, buf = [], []
+            for it in info["map"]:
+                buf.append(it)
+                if len(buf) >= 3:
+                    lines.append("   ".join(buf))
+                    buf = []
+            if buf:
+                lines.append("   ".join(buf))
+            push(cell("报告映射", "\n".join(lines), "role", True))
+
+        if rows:
+            self._hw_set_rows(rows)
+        else:
+            self._hw_set_message("（未能解析指纹，见下方原始数据）")
+
+        self.hw_text.configure(state="normal")
+        self.hw_text.delete("1.0", "end")
+        self.hw_text.insert("end", text)
+        self.hw_text.configure(state="disabled")
+
+    @staticmethod
+    def parse_bridge_info(text):
+        d = {"reports": [], "map": [], "ver_name": ""}
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("OK TARGET"):
+                m = re.search(r"pin=([0-9a-fA-F:]+)", s)
+                if m:
+                    d["mac"] = m.group(1)
+                m = re.search(r"cand=([0-9a-fA-F:]+)", s)
+                if m and m.group(1).replace(":", "").strip("0"):
+                    d["cand"] = m.group(1)          # 全 0 表示没在扫，不显示
+                m = re.search(r"score=(-?\d+)", s)
+                if m:
+                    d["score"] = int(m.group(1))
+                m = re.search(r"why=(\S+)", s)
+                if m:
+                    d["why"] = m.group(1)
+            elif s.startswith("OK BATT"):
+                m = re.search(r"(-?\d+)", s)
+                if m:
+                    d["batt"] = int(m.group(1))     # -1 = 还没读到
+            elif s.startswith("OK STAT"):
+                for k in ("frames", "dropped", "conn", "reports", "voice"):
+                    m = re.search(r"(?<![a-z])%s=(-?\d+)" % k, s)
+                    if m:
+                        d["rcount" if k == "reports" else k] = int(m.group(1))
+            elif s.startswith("OK LINK"):
+                for k in ("mtu", "itvl", "lat", "to"):
+                    m = re.search(r"(?<![a-z])%s=(\d+)" % k, s)
+                    if m:
+                        d[k] = m.group(1)
+            elif s.startswith("OK DLE"):
+                m = re.search(r"max_tx_octets=(\d+)", s)
+                if m:
+                    d["dle_tx"] = m.group(1)
+                m = re.search(r"max_rx_octets=(\d+)", s)
+                if m:
+                    d["dle_rx"] = m.group(1)
+            elif s.startswith("OK SCANDUMP"):
+                m = re.search(r"(\d+)", s)
+                if m:
+                    d["scan"] = int(m.group(1))
+            elif s.startswith("OK INFO"):
+                m = re.search(r"name=([^\s]+)", s)
+                if m:
+                    d["ver_name"] = m.group(1)
+                for k in ("ver", "binds", "learn", "enabled", "connected", "dirty", "audio"):
+                    m = re.search(r"%s=(\d+)" % k, s)
+                    if m:
+                        d[k] = int(m.group(1))
+            elif s.startswith("R "):
+                m = re.search(r"id=(0x[0-9A-Fa-f]+)", s)
+                if m:
+                    d["reports"].append(m.group(1))
+            elif s.startswith("M "):
+                m = re.search(r"id=(0x[0-9A-Fa-f]+)", s)
+                if m:
+                    role = re.search(r"role=(\d+)", s)
+                    by = re.search(r"bytes=(\d+)", s)
+                    rn = {"1": "键盘", "2": "消费者", "3": "数据", "0": "未知"}.get(
+                        role.group(1) if role else "", "")
+                    txt = m.group(1) + (":" + rn if rn else "")
+                    if by:
+                        txt += by.group(1) + "B"
+                    d["map"].append(txt)
+        return d
+
+    @staticmethod
+    def _mask_mac(mac):
+        """（保留）MAC 打码工具；硬件信息页现已按需求显示完整 MAC，不再调用。"""
+        parts = mac.split(":")
+        if len(parts) == 6:
+            return ":".join([parts[0], parts[1], parts[2], "**", "**", parts[5]])
+        return mac
+
+    def _detect_fw_build_name(self):
+        """从程序所在目录（及其 firmware/ 子目录）里找最新的 *.merged.bin，
+        取其构建名作为固件版本显示，例如 cmcc_s3_bridge_v4voice_20261031_2226。
+        找不到时返回空串，由调用方回退到设备上报的 ver=。"""
+        here = app_dir()
+        roots = [here]
+        p = here
+        for _ in range(3):
+            p = os.path.dirname(p)
+            roots.append(p)
+        cands = []
+        for r in roots:
+            if not os.path.isdir(r):
+                continue
+            try:
+                for fn in os.listdir(r):
+                    if fn.endswith(".merged.bin"):
+                        cands.append(os.path.join(r, fn))
+            except Exception:
+                pass
+            fw_dir = os.path.join(r, "firmware")
+            if os.path.isdir(fw_dir):
+                for _root, _dirs, _files in os.walk(fw_dir):
+                    for fn in _files:
+                        if fn.endswith(".merged.bin"):
+                            cands.append(os.path.join(_root, fn))
+        if not cands:
+            return ""
+        cands.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        name = os.path.basename(cands[0])
+        for suf in (".ino.merged.bin", ".merged.bin", ".ino.bin", ".bin", ".ino"):
+            if name.endswith(suf):
+                name = name[: -len(suf)]
+                break
+        return name
+
+    def _hw_clear_display(self):
+        try:
+            self._hw_set_message("正在重新抓取设备指纹…")
+            self.hw_text.configure(state="normal")
+            self.hw_text.delete("1.0", "end")
+            self.hw_text.insert("end", "（抓取中，请稍候…）")
+            self.hw_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _hw_refresh(self):
+        if self.ser is None:
+            messagebox.showwarning("未连接", "先连接 ESP32 桥（顶部「连接」）再抓取。")
+            return
+        # 自动初始化：先清空旧指纹（避免残留陈旧隐私数据），再重新抓取
+        self._hw_clear_display()
+        self._cap = []
+        self._cap_active = True
+        threading.Thread(target=self._hw_capture, daemon=True).start()
+
+    def _hw_capture(self):
+        cmds = ["STAT", "TARGET", "INFO", "REPORTS", "MAPDUMP", "BATT", "SCANDUMP"]
+        self._cap = []
+        self._cap_active = True
+        try:
+            for c in cmds:
+                if self.ser is None:
+                    break
+                try:
+                    self.ser.write((c + "\n").encode())
+                except Exception:
+                    break
+                time.sleep(1.0)
+        finally:
+            self._cap_active = False
+        text = "\n".join(self._cap)
+        try:
+            with open(os.path.join(app_dir(), "bridge_info.txt"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except Exception:
+            pass
+        # 子线程不能直接 self.after（会撞 "main thread is not in main loop"），
+        # 一律走 ui_q 由主线程的 _drain 执行。
+        self.ui_q.put(lambda: self._hw_render(text))
+
+    # --------------------------------------------------- 页2：按键映射 ----
+    def _page_keys(self):
+        if self.pages[1] is not None:
+            return
+        f = tk.Frame(self.content, bg=BG)
+        self.pages[1] = f
+        area = tk.Frame(f, bg=BG)
         area.pack(fill="both", expand=True, padx=0, pady=0)
         self.canvas = tk.Canvas(area, bg=BG, highlightthickness=0,
                                 width=self._win_w(), height=self._win_h())
         self.canvas.pack()
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-1>", self._on_click)
-
         self._draw_background()
         self._layout()
 
-        bar = tk.Frame(self, bg=BG)
+        bar = tk.Frame(f, bg=BG)
         bar.pack(fill="x", padx=zp(14), pady=(zp(8), zp(12)))
         self.btn_save = tk.Button(bar, text="保存到设备", command=self.cmd_save,
                                   bg=BTN, fg=BTN_FG, relief="flat", borderwidth=0,
@@ -1771,19 +2514,929 @@ class App(tk.Tk):
                                   font=("Microsoft YaHei UI", zp(8)))
         self.lbl_dirty.pack(side="right", padx=(zp(24), 0))
 
-        # 窗口高度按实际需要算：画布 + 上下两条工具栏，否则底部按钮会被挤出去
-        self.update_idletasks()
-        w = WIN_W + zp(20)
-        h = self.winfo_reqheight() + zp(4)
-        if fix_size or self._base_wh is None:
-            self._base_wh = (w, h)
-            self._base_z = Z
-            self.geometry("%dx%d" % (w, h))
-            # 锁死纵横比：拖拽时内容整体等比缩放，不会把遥控器拉扁
+    # --------------------------------------------------- 页3：语音方案 ----
+    def _page_voice(self):
+        if self.pages[2] is not None:
+            return
+        f = tk.Frame(self.content, bg=BG)
+        self.pages[2] = f
+        pad = tk.Frame(f, bg=BG, padx=zp(20), pady=zp(18))
+        pad.pack(fill="both", expand=True)
+        self.chk_asr = BigCheck(pad, text="勾选后语音键录音并直接输出文字",
+                                var=self.var_asr, command=self.toggle_asr, box=22)
+        self.chk_asr.pack(anchor="w", pady=(0, zp(8)))
+        self._off_note = self._pick_note(ASR_OFF_NOTES)
+        self.lbl_asr = tk.Label(pad, text=self._off_note, anchor="w", bg=BG,
+                                fg=TEXT_DIM, font=("Microsoft YaHei UI", zp(10)))
+        self.lbl_asr.pack(anchor="w", pady=(0, zp(12)))
+        info = ("本地离线语音识别链路：\n"
+                "遥控器麦克风 → BLE(G.722.1/Siren7) → ESP32 桥 → 串口 → 本程序解码 "
+                "→ sherpa-onnx 识别 → 直接输入文字。\n"
+                "全程不联网；首次开启会加载识别模型（约 1~2 秒）。")
+        tk.Label(pad, text=info, anchor="w", justify="left", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9)), wraplength=zp(540)
+                 ).pack(anchor="w", pady=(0, zp(12)))
+        tk.Label(pad, text="语音转文字测试 / 自检输出", bg=BG, fg=TEXT,
+                 font=("Microsoft YaHei UI", zp(10), "bold")).pack(anchor="w", pady=(zp(6), zp(4)))
+        boxf = tk.Frame(pad, bg=BG)
+        boxf.pack(fill="both", expand=True)
+        self.voice_box = tk.Text(boxf, bg="#0f1c16", fg="#c8f0d8", relief="flat",
+                                 font=("Consolas", zp(9)), wrap="word",
+                                 state="disabled", height=8)
+        self.voice_box.pack(side="left", fill="both", expand=True)
+        vscb = tk.Scrollbar(boxf, command=self.voice_box.yview)
+        vscb.pack(side="right", fill="y")
+        self.voice_box.configure(yscrollcommand=vscb.set)
+        bbox = tk.Frame(pad, bg=BG)
+        bbox.pack(fill="x", pady=(zp(8), 0))
+        tk.Button(bbox, text="运行环境自检", command=self._run_diag,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", ipadx=zp(6), ipady=zp(2))
+        tk.Button(bbox, text="清空", command=self._voice_clear,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", padx=zp(8), ipadx=zp(6), ipady=zp(2))
+
+    def _voice_clear(self):
+        try:
+            self.voice_box.configure(state="normal")
+            self.voice_box.delete("1.0", "end")
+            self.voice_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _diag_mask(line):
+        """隐私脱敏：本地用户名路径打码，避免自检输出泄露 C:\\Users\\xxx。"""
+        m = re.search(r"(C:\\[Uu]sers\\[^\\]+)", line)
+        if m:
+            line = line.replace(m.group(1), "C:\\Users\\***")
+        return line
+
+    def _voice_print(self, s):
+        box = getattr(self, "voice_box", None)
+        if box is None:
+            return
+        try:
+            box.configure(state="normal")
+            if str(box.index("end-1c")) != "1.0":
+                box.insert("end", "\n")
+            box.insert("end", s)
+            box.configure(state="disabled")
+            box.see("end")
+        except Exception:
+            pass
+
+    def _run_diag(self):
+        try:
+            p = write_diag()
             try:
-                self.wm_aspect(w, h, w, h)
+                with open(p, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+            except Exception:
+                content = ""
+            self._voice_print("==== 运行环境自检（%s）====" % p)
+            for line in content.splitlines():
+                self._voice_print(self._diag_mask(line))
+            self._voice_print("")
+            messagebox.showinfo("自检完成",
+                                "环境自检结果已写入：\n%s\n（同时已显示在下方文本框，用户名已脱敏）" % p)
+        except Exception as e:
+            self._voice_print("[自检失败] %s" % e)
+            messagebox.showerror("自检失败", str(e))
+
+    # ------------------------------------------------- 页4：固件烧录 ------
+    def _page_flash(self):
+        if self.pages[3] is not None:
+            return
+        f = tk.Frame(self.content, bg=BG)
+        self.pages[3] = f
+        ctl = tk.Frame(f, bg=BG, padx=zp(18), pady=zp(14))
+        ctl.pack(fill="x")
+        tk.Label(ctl, text="固件烧录", bg=BG, fg=TEXT,
+                 font=("Microsoft YaHei UI", zp(14), "bold")).pack(anchor="w", pady=(0, zp(10)))
+
+        row1 = tk.Frame(ctl, bg=BG)
+        row1.pack(fill="x", pady=(0, zp(6)))
+        tk.Label(row1, text="固件文件", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(side="left")
+        self.flash_fw = tk.Entry(row1, bg=PANEL, fg=TEXT, relief="flat",
+                                 font=("Consolas", zp(9)))
+        self.flash_fw.pack(side="left", fill="x", expand=True, padx=zp(6), ipady=zp(3))
+        self.flash_fw.bind("<KeyRelease>", lambda e: self._update_chip())
+        dw = self._default_firmware()
+        if dw:
+            self.flash_fw.insert(0, dw)
+        tk.Button(row1, text="浏览…", command=self._flash_browse,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", padx=(zp(4), 0), ipadx=zp(6), ipady=zp(2))
+
+        row2 = tk.Frame(ctl, bg=BG)
+        row2.pack(fill="x", pady=(0, zp(6)))
+        tk.Label(row2, text="端口", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(side="left")
+        self.flash_port_lbl = tk.Label(row2, text=self.cbo_port.get() or "—（顶部连接）",
+                                       bg=BG, fg=TEXT, font=("Consolas", zp(9)))
+        self.flash_port_lbl.pack(side="left", padx=zp(6))
+        tk.Label(row2, text="芯片", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(side="left", padx=(zp(14), 0))
+        # 芯片栏只显示型号本体，识别依据放进悬浮提示 —— 带上「（esptool 实测）」
+        # 会把这一行撑长，把右边的波特率挤出可视区（窗口窄时尤其明显）。
+        self.flash_chip_lbl = tk.Label(row2, text="未知", bg=BG, fg=TEXT,
+                                       width=9, anchor="w",
+                                       font=("Consolas", zp(9)))
+        self.flash_chip_lbl.pack(side="left", padx=zp(6))
+        # 保留上一次的识别依据：整页重建（等比缩放）后要靠它判断是否该恢复实测结果
+        self._chip_why = getattr(self, "_chip_why", "")
+        self._chip_tip = HoverTip(self.flash_chip_lbl, "芯片型号自动识别")
+        tk.Button(row2, text="检测芯片", command=self._flash_detect_chip,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(8))
+                  ).pack(side="left", ipadx=zp(4), ipady=zp(1))
+        tk.Label(row2, text="波特率", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(side="left", padx=(zp(14), 0))
+        self.flash_baud = tk.StringVar(value="921600")
+        om = tk.OptionMenu(row2, self.flash_baud, "921600", "460800", "230400", "115200")
+        om.configure(bg=PANEL, fg=TEXT, relief="flat",
+                     font=("Consolas", zp(9)), highlightthickness=0)
+        om.pack(side="left", padx=zp(6))
+
+        row3 = tk.Frame(ctl, bg=BG)
+        row3.pack(fill="x", pady=(zp(4), zp(8)))
+        tk.Button(row3, text="开始刷写", command=self._flash_start,
+                  bg=BTN, fg=BTN_FG, relief="flat", borderwidth=0,
+                  activebackground="#0f8b4c", activeforeground="#ffffff",
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", ipadx=zp(10), ipady=zp(2))
+        tk.Button(row3, text="保存日志", command=self._flash_save,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", padx=zp(8), ipadx=zp(6), ipady=zp(2))
+        tk.Button(row3, text="清空", command=self._flash_clear,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", ipadx=zp(6), ipady=zp(2))
+        self.flash_autoscroll = tk.BooleanVar(value=True)
+        tk.Checkbutton(row3, text="自动滚屏", variable=self.flash_autoscroll,
+                       bg=BG, fg=TEXT_DIM, selectcolor=PANEL, activebackground=BG,
+                       font=("Microsoft YaHei UI", zp(9))
+                       ).pack(side="left", padx=zp(12))
+        self.flash_wrap = tk.BooleanVar(value=True)
+        tk.Checkbutton(row3, text="自动换行", variable=self.flash_wrap,
+                       bg=BG, fg=TEXT_DIM, selectcolor=PANEL, activebackground=BG,
+                       font=("Microsoft YaHei UI", zp(9)), command=self._flash_toggle_wrap
+                       ).pack(side="left")
+
+        logf = tk.Frame(f, bg=BG, padx=zp(18))
+        logf.pack(fill="both", expand=True, pady=(0, zp(14)))
+        self.flash_log = tk.Text(logf, bg="#0f1c16", fg="#c8f0d8", relief="flat",
+                                 font=("Consolas", zp(9)), wrap="word",
+                                 state="disabled", height=12)
+        self.flash_log.pack(side="left", fill="both", expand=True)
+        # 串口实时输出混在刷写日志里，给最常看的按键行和错误行上色，便于扫读
+        self.flash_log.tag_configure("key", foreground="#5ddcae")
+        self.flash_log.tag_configure("err", foreground="#ff8f80")
+        lscb = tk.Scrollbar(logf, command=self.flash_log.yview)
+        lscb.pack(side="right", fill="y")
+        self.flash_log.configure(yscrollcommand=lscb.set)
+        self._flash_print(
+            "就绪。固件默认指向程序所在文件夹，点「浏览」从该目录选 .bin。\n"
+            "点「开始刷写」即可，程序会自动让芯片进下载模式（1200bps touch，等效按 BOOT）。\n"
+            "· 自动复位失败时才需要手动：按住 BOOT 不放 → 点一下 EN → 松开 BOOT。\n"
+            "· 进下载模式后 COM 号会变（实测 COM11 → COM10），程序会自动跟上；\n"
+            "  手动刷时可点「扫端口」重新识别。\n"
+            "· merged.bin 从 0x0 整片写入会清掉 NVS 里的按键映射，刷前先在按键页\n"
+            "  点「从设备读取」把映射读出来备份。\n"
+            "日志实时滚屏，可「保存日志」导出。\n")
+        self._update_chip()
+
+    # ---- 页4 辅助 ----
+    def _default_firmware(self):
+        """默认指向程序（.py / exe）所在文件夹，由用户再浏览选择 .bin。"""
+        return app_dir()
+
+    def _detect_chip(self, path):
+        """从固件文件名尝试识别芯片型号，识别不到返回「未知」。"""
+        p = (path or "").lower()
+        if "esp32s3" in p:
+            return "ESP32-S3"
+        if "esp8266" in p:
+            return "ESP8266"
+        if "esp32" in p:
+            return "ESP32"
+        if "s3" in p:
+            return "ESP32-S3"
+        return "未知"
+
+    # ESP 镜像头 chip_id → 芯片名（esptool/esptool 的 ESP_CHIP_ID_*）
+    _CHIP_IDS = {0x0000: "ESP32", 0x0002: "ESP32-S2", 0x0005: "ESP32-C3",
+                 0x0009: "ESP32-S3", 0x000C: "ESP32-C2", 0x000D: "ESP32-C6",
+                 0x0010: "ESP32-H2", 0x0012: "ESP32-P4"}
+
+    # 芯片名 → esptool --chip 参数
+    _CHIP_ARGS = {"ESP32": "esp32", "ESP32-S2": "esp32s2", "ESP32-S3": "esp32s3",
+                  "ESP32-C3": "esp32c3", "ESP32-C6": "esp32c6",
+                  "ESP32-C2": "esp32c2", "ESP32-H2": "esp32h2",
+                  "ESP32-P4": "esp32p4"}
+
+    def _chip_from_image(self, path):
+        """读固件镜像自带的芯片标识（ESP 镜像头里的 chip_id，偏移 12）。
+
+        merged.bin 的 0x0 是 bootloader、0x10000 是 app，两段头里都有 chip_id，
+        比按文件名猜可靠得多，也不用连设备。返回 (芯片名, 依据说明)。
+        """
+        try:
+            if not path or not os.path.isfile(path):
+                return "", ""
+            with open(path, "rb") as fh:
+                blob = fh.read(0x10018)
+        except Exception:
+            return "", ""
+        for off, tag in ((0x10000, "镜像app段"), (0x0, "镜像头")):
+            if len(blob) < off + 16:
+                continue
+            if blob[off] != 0xE9:          # ESP 镜像 magic
+                continue
+            cid = blob[off + 12] | (blob[off + 13] << 8)
+            name = self._CHIP_IDS.get(cid)
+            if name:
+                return name, tag
+        return "", ""
+
+    def _chip_label(self, name, why=""):
+        """写芯片栏：标签只放型号本体，依据走悬浮提示，避免撑长这一行。"""
+        self._chip_name = name or ""
+        self._chip_why = why or ""
+        try:
+            self.flash_chip_lbl.configure(text=name if name else "未知")
+        except Exception:
+            pass
+        try:
+            tip = ("当前芯片：%s\n识别依据：%s" % (name, why)) if name else \
+                  ("点「检测芯片」用 esptool 直连读取型号。\n"
+                   "未检测时会先按所选固件镜像头里的 chip_id 推断。")
+            self._chip_tip.text = tip
+        except Exception:
+            pass
+
+    def _update_chip(self):
+        """芯片栏自动识别：优先读镜像头（准确），读不到再退回文件名，最后「未知」。
+
+        识别不出来时不覆盖已有的 esptool 实测结果 —— 否则等比缩放整页重建、
+        或固件路径暂时为空，都会把刚检测到的型号冲成「未知」。
+        """
+        try:
+            path = self.flash_fw.get().strip()
+            name, why = self._chip_from_image(path)
+            if not name:
+                guess = self._detect_chip(path)
+                name = "" if guess == "未知" else guess
+                why = "据文件名推断"
+            if not name and getattr(self, "_chip_why", "") == "esptool 实测" \
+                    and getattr(self, "_chip_name", ""):
+                self._chip_label(self._chip_name, self._chip_why)
+                return
+            self._chip_label(name, why)
+        except Exception:
+            pass
+
+    def _set_chip(self, name, why=""):
+        """外部（esptool 实测）写回芯片型号。"""
+        self._chip_label(name, why)
+
+    def _chip_arg(self):
+        name = getattr(self, "_chip_name", "") or self._detect_chip(
+            self.flash_fw.get().strip())
+        return self._CHIP_ARGS.get(name, "esp32s3")
+
+    def _flash_browse(self):
+        # 单击浏览：直接打开地址栏里当前显示的地址（文件夹或文件所在目录）
+        cur = self.flash_fw.get().strip()
+        if cur and os.path.isdir(cur):
+            initialdir = cur
+        elif cur and os.path.isfile(cur):
+            initialdir = os.path.dirname(cur)
+        else:
+            initialdir = app_dir()
+        p = filedialog.askopenfilename(
+            title="选择固件 .bin", initialdir=initialdir,
+            filetypes=[("固件镜像", "*.bin"), ("全部", "*.*")])
+        if p:
+            self.flash_fw.delete(0, "end")
+            self.flash_fw.insert(0, p)
+            self._update_chip()
+
+    def _flash_detect_chip(self):
+        """用 esptool 直连串口读芯片型号。
+
+        USB 描述符只能看出是 Espressif 设备（303A:1001 覆盖 S3/C3/C6 等多款），
+        分不出具体型号；要准确型号只能让芯片进下载模式问它本人——代价是复位一次、
+        桥接中断几秒，所以做成手动按钮，并在结束后自动重连。
+        """
+        if getattr(self, "_chip_probing", False):
+            return
+        port = self.cbo_port.get().strip()
+        if not port:
+            messagebox.showwarning("未选端口", "先在顶部填入或扫描出串口。")
+            return
+        if not messagebox.askyesno(
+                "检测芯片",
+                "将用 esptool 直连 %s 读取芯片型号。\n"
+                "程序会先发 1200bps touch 让芯片自动进下载模式（不用按 BOOT），\n"
+                "期间串口被独占、遥控器桥接中断约 5~10 秒，检测完自动重连。\n\n"
+                "继续？" % port):
+            return
+        reconnect = self.ser is not None
+        if reconnect:
+            self.close_port()
+            time.sleep(0.4)
+        self._chip_probing = True
+        self._flash_print("\n=== 检测芯片：esptool %s（复位芯片）===\n" % port)
+        threading.Thread(target=self._chip_probe_run,
+                         args=(port, reconnect), daemon=True).start()
+
+    # esptool 各版本报芯片型号的写法都不一样，逐个兜住：
+    #   v5: "Chip type:          ESP32-S3 (QFN56) (revision v0.1)"
+    #       "Detecting chip type... ESP32-S3" / "Connected to ESP32-S3 on COM6:"
+    #   v4: "Chip is ESP32-S3 (revision 0.1)" / "Chip is ESP32-D0WDQ6 (revision 1.0)"
+    _CHIP_PATS = (
+        re.compile(r"^Chip type:\s+([A-Za-z0-9][\w\-]*)", re.M),
+        re.compile(r"\bChip is\s+([A-Za-z0-9][\w\-]*)"),
+        re.compile(r"Detecting chip type\.\.\.\s*([A-Za-z0-9][\w\-]*)"),
+        re.compile(r"Connected to\s+([A-Za-z0-9][\w\-]*)\s+on\s+"),
+    )
+
+    @classmethod
+    def _parse_chip(cls, txt):
+        """从 esptool 输出里取芯片型号，取不到返回空串。"""
+        for pat in cls._CHIP_PATS:
+            m = pat.search(txt or "")
+            if m:
+                name = m.group(1).strip("-").upper()
+                if name.startswith("ESP"):
+                    return name
+        return ""
+
+    def _norm_chip(self, name):
+        """把 ESP32-D0WDQ6 / ESP32-S3(QFN56) 之类归一成表里的规范名。"""
+        name = (name or "").strip().upper()
+        if not name:
+            return ""
+        if name in self._CHIP_ARGS:
+            return name
+        for known in sorted(self._CHIP_ARGS, key=len, reverse=True):
+            if name.startswith(known):
+                return known
+        return "ESP32" if name.startswith("ESP32") else name
+
+    @staticmethod
+    def _esptool_fail_reason(txt):
+        """把 esptool 的报错翻成一句人能直接照做的提示。"""
+        t = (txt or "").lower()
+        if "no serial data received" in t:
+            return ("串口没有任何回应 —— 芯片没进下载模式（按住 BOOT 点一下 EN 再松手），"
+                    "或该口是外置 USB 转串口、没有自动复位电路。")
+        if ("access is denied" in t or "could not open port" in t
+                or "permissionerror" in t):
+            return "串口被占用 —— 先点「断开」，或关掉其它串口工具再试。"
+        if "invalid choice" in t or "unrecognized" in t:
+            return "esptool 版本太旧 —— 升级：pip install -U esptool"
+        if "failed to connect" in t or "wrong boot mode" in t:
+            return "握手失败 —— 手动进下载模式：按住 BOOT → 点 EN → 松开 BOOT。"
+        return ""
+
+    @staticmethod
+    def _flash_fail_reason(txt):
+        """把 esptool 刷写失败的报错翻成一句能直接照做的话。"""
+        t = (txt or "").lower()
+        if ("permissionerror" in t or "could not open port" in t
+                or "port is busy" in t or "access is denied" in t):
+            return ("端口被占用或不存在 —— 本程序若正连着会自动断开；仍报错就关掉"
+                    "其它串口工具/残留进程，或点「扫端口」重新确认端口号。")
+        if "no serial data received" in t:
+            return ("芯片没有任何回应 —— 自动复位（1200bps touch）没生效。"
+                    "手动进下载模式：按住 BOOT → 点一下 EN → 松开 BOOT，"
+                    "再点「扫端口」确认新端口后重试。")
+        if "failed to connect" in t or "wrong boot mode" in t:
+            return ("连不上芯片 —— 手动进下载模式：按住 BOOT → 点 EN → 松开 BOOT。"
+                    "另外该口若是固件自定义复合 USB 的 CDC 口，运行态刷不了。")
+        if "does not fit" in t or "not enough space" in t or "out of bounds" in t:
+            return "镜像超出 flash 范围 —— 检查芯片型号与 FlashSize 是否选对。"
+        if "md5" in t or "checksum" in t or "verify failed" in t:
+            return "写入校验失败 —— 多半是 USB 线/供电问题，换线或把波特率降到 460800 重试。"
+        if "invalid choice" in t or "unrecognized" in t:
+            return "esptool 版本不认这个命令 —— 升级：pip install -U esptool"
+        return ""
+
+    def _port_identity(self, dev):
+        """返回该串口的身份（序列号 + 复合 USB 接口号 + 描述）。
+
+        ESP32-S3 常把多个接口塞进一个复合 USB 设备，LOCATION 末尾的 :x.N
+        就是接口号（N=0 即 PnP 里的 MI_00）。只有承载 USB-Serial-JTAG 的那个
+        接口能被 esptool 下载，其余接口（固件自定义 CDC/HID）一律连不上，
+        所以失败时把身份打出来，用户一眼能看出选错口了。
+        """
+        try:
+            for i in self._list_ports():
+                if i["dev"].upper() != (dev or "").strip().upper():
+                    continue
+                parts = []
+                if i.get("ser"):
+                    parts.append("序列号 %s" % i["ser"])
+                m = re.search(r":x\.(\d+)$", i.get("loc") or "")
+                if m:
+                    parts.append("接口 MI_%02d" % int(m.group(1)))
+                if i.get("desc"):
+                    parts.append(i["desc"])
+                return "，".join(parts)
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _kill_quiet(proc):
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+    def _chip_probe_run(self, port, reconnect):
+        ui = self.ui_q          # 子线程一律走队列，直接碰 Tk 会崩
+        chip, last = "", ""
+        t0 = time.time()
+        try:
+            et = self._resolve_esptool()
+            # 桥接板运行态是 TinyUSB 复合 USB，PID 也是 0x1001，esptool 会误判成
+            # 硬件 USB-JTAG 口、发 JTAG 控制请求（TinyUSB 不响应）→ 永远连不上。
+            # 先 1200bps touch 让它自己进 ROM 下载模式，端口号会变。
+            new_port = self._soft_enter_boot(port, ui)
+            if new_port:
+                port = new_port
+                ui.put(lambda p=port: self._set_port(p))
+                ui.put(lambda p=port: self._flash_print(
+                    "[检测] 芯片已进下载模式，端口 %s\n" % p))
+                pre = ["--before", "no_reset"]
+            else:
+                pre = []
+            # v5 起 chip_id 改名 chip-id（旧名仅打 DEPRECATED 警告仍会跑），
+            # 所以先试新名，报 invalid choice 才退回旧名。
+            for sub in ("chip-id", "chip_id"):
+                cmd = et + ["--port", port] + pre + [sub]
+                ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
+                try:
+                    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True,
+                                            bufsize=1, creationflags=flag)
+                except FileNotFoundError:
+                    ui.put(lambda: self._flash_print(
+                        "[错误] 找不到 esptool。请先安装：pip install -U esptool\n"))
+                    return
+                out = []
+                killer = threading.Timer(75.0, self._kill_quiet, args=(proc,))
+                killer.daemon = True
+                killer.start()
+                try:
+                    if proc.stdout:
+                        for line in proc.stdout:
+                            out.append(line)
+                            ui.put(lambda l=line: self._flash_insert(
+                                l.rstrip("\r\n") + "\n"))
+                    proc.wait()
+                finally:
+                    killer.cancel()
+                last = "".join(out)
+                chip = self._parse_chip(last)
+                if chip:
+                    break
+                if not re.search(r"invalid choice|unrecognized|unknown command|no such",
+                                 last, re.I):
+                    break        # 命令本身有效，只是没连上，别再用旧名重试一遍
+        except Exception as e:
+            ui.put(lambda: self._flash_print("[检测异常] %s\n" % e))
+        finally:
+            self._chip_probing = False
+        if chip:
+            name = self._norm_chip(chip)
+            ui.put(lambda: self._set_chip(name, "esptool 实测"))
+            ui.put(lambda: self._flash_print("=== 芯片：%s ===\n" % name))
+        else:
+            why = self._esptool_fail_reason(last)
+            if not last.strip():
+                why = why or "esptool 没有任何输出。"
+            if time.time() - t0 >= 70:
+                why = (why + " " if why else "") + "（等待超时，已强制结束）"
+            ident = self._port_identity(port)
+            ui.put(lambda: self._flash_print(
+                "[检测失败] 没读到芯片型号。%s\n" % (why or "")))
+            if ident:
+                ui.put(lambda: self._flash_print("  %s 身份：%s\n" % (port, ident)))
+            ui.put(lambda: self._flash_print(
+                "  自动复位（1200bps touch）没能让芯片进下载模式。\n"
+                "  手动兜底：按住 BOOT → 点一下 EN → 松开 BOOT，再点「扫端口」后重试。\n"))
+            ui.put(lambda: self._flash_print(
+                "  提示：芯片栏已保留固件镜像里读到的型号，不影响按镜像刷写。\n"))
+        # 检测完 esptool 会把芯片 hard reset 回 app，端口重新枚举回原号，
+        # 所以先重扫再连，别拿下载模式那个口号去连。
+        ui.put(lambda: self.after(800, self._after_flash_reconnect
+                                  if reconnect else self.refresh_ports))
+
+    def _flash_insert(self, text, tag=None):
+        try:
+            w = self.flash_log
+            w.configure(state="normal")
+            if tag:
+                w.insert("end", text, tag)
+            else:
+                w.insert("end", text)
+            # 串口输出会一直往这个框里灌，加个行数上限，否则跑一夜界面会卡死
+            self._flash_n = getattr(self, "_flash_n", 0) + text.count("\n")
+            if self._flash_n > 4500:
+                try:
+                    n = int(w.index("end-1c").split(".")[0])
+                except Exception:
+                    n = 0
+                if n > 3800:
+                    w.delete("1.0", "%d.0" % (n - 3000))
+                    self._flash_n = 3000
+            w.configure(state="disabled")
+            if self.flash_autoscroll.get():
+                w.see("end")
+        except Exception:
+            pass
+
+    def _flash_rx(self, line):
+        """把串口收到的一行实时镜像到页4 日志（按键报告 # KEY / 状态 OK / 映射 M 全都在）。
+
+        以前 `_handle` 对 `#` 开头的行直接 return，而固件每次按键正是打
+        `# KEY 0046 DOWN src=map usage=0x046 map=yes` —— 于是页4 一行实时输出都没有。
+        `_handle` 由主线程的 `_drain` 调用，这里可以直接碰 Tk。
+        音频行（`A `）在 `_reader` 里已旁路，不会进来刷屏。
+        """
+        try:
+            if not line:
+                return
+            ts = time.strftime("%H:%M:%S") + (".%03d" % (int(time.time() * 1000) % 1000))
+            tag = None
+            if line.startswith("# KEY ") or line.startswith("L "):
+                tag = "key"          # 按键响应，最常看的一行
+            elif "ERROR" in line or line.startswith("[刷写失败]"):
+                tag = "err"
+            self._flash_insert("[%s] %s\n" % (ts, line), tag)
+        except Exception:
+            pass
+
+    def _flash_print(self, s):
+        self._flash_insert(s)
+
+    def _flash_append(self, line):
+        self.after(0, lambda: self._flash_insert(line + "\n"))
+
+    def _flash_toggle_wrap(self):
+        self.flash_log.configure(wrap=("word" if self.flash_wrap.get() else "none"))
+
+    def _flash_clear(self):
+        self.flash_log.configure(state="normal")
+        self.flash_log.delete("1.0", "end")
+        self.flash_log.configure(state="disabled")
+        self._flash_n = 0
+
+    def _flash_save(self):
+        p = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            filetypes=[("日志", "*.log"), ("文本", "*.txt"), ("全部", "*.*")],
+            title="保存刷写日志")
+        if not p:
+            return
+        try:
+            txt = self.flash_log.get("1.0", "end")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(txt)
+            self._flash_print("[日志已保存] %s\n" % p)
+        except Exception as e:
+            self._flash_print("[保存失败] %s\n" % e)
+
+    def _resolve_esptool(self):
+        """找 esptool：PATH → 程序目录 → 常见 pip 安装位置 → 当前解释器 -m。
+
+        打包成单文件 exe 发到干净机器时 PATH 里通常没有 esptool，只在 PATH 里找
+        会直接报「找不到 esptool」。这里再扫几个标准落地位置；只缓存真正找到文件
+        的结果，用户中途安装后下次点击仍能重新发现。
+        """
+        cached = getattr(self, "_esptool_cached", None)
+        if cached:
+            return list(cached)
+        for name in ("esptool", "esptool.exe", "esptool.py"):
+            pp = shutil.which(name)
+            if pp:
+                self._esptool_cached = [pp]
+                return [pp]
+        home = os.path.expanduser("~")
+        local = os.environ.get("LOCALAPPDATA", "")
+        roaming = os.environ.get("APPDATA", "")
+        fixed = [
+            os.path.join(app_dir(), "esptool.exe"),
+            os.path.join(app_dir(), "esptool", "esptool.exe"),
+            os.path.join(app_dir(), "venv", "Scripts", "esptool.exe"),
+            os.path.join(home, "esptool", "venv", "Scripts", "esptool.exe"),
+            os.path.join(local, "Programs", "esptool", "esptool.exe"),
+        ]
+        for root in (os.path.join(local, "Programs", "Python"),
+                     os.path.join(roaming, "Python")):
+            try:
+                for d in sorted(os.listdir(root), reverse=True):
+                    fixed.append(os.path.join(root, d, "Scripts", "esptool.exe"))
             except Exception:
                 pass
+        for p in fixed:
+            try:
+                if p and os.path.isfile(p):
+                    self._esptool_cached = [p]
+                    return [p]
+            except Exception:
+                continue
+        return [sys.executable, "-m", "esptool"]
+
+    def _esptool_cmd(self, et, chip, port, baud, fw, no_reset=False):
+        """拼写刷写命令。no_reset=True 用于「芯片已被本程序软复位进下载模式」。"""
+        cmd = list(et) + ["--chip", chip, "--port", port, "--baud", baud]
+        if no_reset:
+            cmd += ["--before", "no_reset"]
+        return cmd + ["write_flash", "0x0", fw]
+
+    @staticmethod
+    def _loc_key(info):
+        """USB 物理位置前缀，如 '1-11:x.1' → '1-11'。同一根线重新枚举后前缀不变。"""
+        return ((info or {}).get("loc") or "").split(":")[0]
+
+    @staticmethod
+    def _loc_full(info):
+        """完整 USB 位置，如 '1-11:x.1'。末尾数字是复合设备的接口号：
+        运行态 CDC 在 MI_01（.1），进 ROM 后 USB-Serial/JTAG 在 MI_00（.0）。
+        所以「接口号变了」本身就是「换了模式」的硬证据。"""
+        return (info or {}).get("loc") or ""
+
+    @staticmethod
+    def _touch_once(port):
+        """发一次 1200bps touch。返回 True=已发出，None=端口打不开。"""
+        try:
+            s = serial.Serial(port, 115200, timeout=0.2)
+        except Exception:
+            return None
+        try:
+            try:
+                s.write(b"\r\n")   # 先通一次数据，确认 CDC 端点真的开了
+                s.flush()
+            except Exception:
+                pass
+            time.sleep(0.35)
+            s.baudrate = 1200      # ← 触发 usb_persist_restart(RESTART_BOOTLOADER)
+        except Exception:
+            pass                   # 芯片此刻断开重连，报 OSError 22 属正常
+        try:
+            time.sleep(0.25)
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+        return True
+
+    def _soft_enter_boot(self, port, ui, tries=2):
+        """用 1200bps touch 让固件自己重启进 ROM 下载模式 —— 等效按 BOOT 键。
+
+        依据 `cores/esp32/USBCDC.cpp:283` 的 `_onLineCoding`：
+            if (reboot_enable && _bit_rate == 1200) usb_persist_restart(RESTART_BOOTLOADER);
+        内部把 `RTC_CNTL_OPTION1_REG` 置 `FORCE_DOWNLOAD_BOOT`，下次复位直接进 ROM。
+        Arduino IDE 上传就是靠这条机制（注释里写着 "ArduinoIDE sends LineCoding
+        with 1200bps baud to reset the device"）。
+
+        **实测结论（2026-11-04）**：DTR/RTS 四步序列在这块板上完全无效（信号线
+        回读正确、固件毫无反应）；1200bps 才有效，且设备会重新枚举。
+
+        判定「真的复位了」的唯一硬证据是 **原端口从列表里消失**。只看「同一 USB
+        位置上还有个口」会误判：复位前后都叫 COM11 的那一瞬间就会被当成成功，
+        然后拿一个已经失效的口去刷（2026-11-04 用户实测踩过）。
+
+        返回下载模式下的端口号；没复位成功返回 None。
+        """
+        before = self._list_ports()
+        old = {i["dev"] for i in before}
+        want_loc, orig_loc = "", ""
+        for i in before:
+            if i["dev"] == port:
+                want_loc = self._loc_key(i)
+                orig_loc = self._loc_full(i)
+
+        for attempt in range(1, tries + 1):
+            if attempt > 1:
+                # 上一轮可能把口号换掉了，先在原地重新认一下
+                now = self._list_ports()
+                if port not in {i["dev"] for i in now}:
+                    for i in now:
+                        if i["esp"] and (not want_loc or self._loc_key(i) == want_loc):
+                            port = i["dev"]
+                            break
+                ui.put(lambda a=attempt: self._flash_print(
+                    "[软复位] 第 %d 次尝试重新复位…\n" % a))
+                time.sleep(0.8)
+            if self._touch_once(port) is None:
+                ui.put(lambda: self._flash_print(
+                    "[软复位] 打不开 %s，改用 esptool 自带复位\n" % port))
+                return None
+            ui.put(lambda a=attempt: self._flash_print(
+                "[软复位] 第 %d 次 1200bps touch 已发出，等端口重新枚举…\n" % a))
+
+            # ① 原端口必须先消失，否则说明 touch 根本没生效
+            vanished = False
+            for _ in range(20):       # 最多 5 秒
+                time.sleep(0.25)
+                if port not in {i["dev"] for i in self._list_ports()}:
+                    vanished = True
+                    break
+            if not vanished:
+                continue
+
+            # ② 找下载模式的端口
+            newp = self._wait_boot_port(port, old, want_loc, orig_loc)
+            if newp:
+                return newp
+            ui.put(lambda: self._flash_print(
+                "[软复位] 芯片重启了但没进下载模式（接口号没变，还在 app 里）\n"))
+        ui.put(lambda: self._flash_print(
+            "[软复位] 多次尝试仍未进下载模式，改用 esptool 自带复位\n"))
+        return None
+
+    def _wait_boot_port(self, port, old, want_loc, orig_loc):
+        """等下载模式的新端口，最多 6 秒；认不出来返回 None。
+
+        判据按可信度排：
+          ① 同一 USB 位置上的**另一个**口号（COM11 → COM10）
+          ② 新出现的乐鑫口
+          ③ 原口号回来了、但**接口号变了**（.1 CDC → .0 USB-Serial/JTAG）
+        「原口号回来且接口号没变」只是普通重启回 app，不算成功 —— 这正是
+        2026-11-04 用户那次失败的根因（拿一个还停在 app 的 COM11 去刷）。
+        """
+        for k in range(24):
+            now = self._list_ports()
+            for i in now:
+                if i["esp"] and i["dev"] != port and (
+                        not want_loc or self._loc_key(i) == want_loc):
+                    return i["dev"]
+            for i in now:
+                if i["esp"] and i["dev"] not in old:
+                    return i["dev"]
+            if k >= 4:
+                for i in now:
+                    if i["dev"] == port and i["esp"]:
+                        if orig_loc and self._loc_full(i) != orig_loc:
+                            return port
+            time.sleep(0.25)
+        return None
+
+    def _flash_start(self):
+        if getattr(self, "_flash_running", False):
+            self._flash_print("[提示] 上一次刷写尚未结束。\n")
+            return
+        fw = self.flash_fw.get().strip()
+        if not fw or not os.path.isfile(fw):
+            messagebox.showerror("固件缺失", "请先选择固件 .bin 文件（含 merged.bin）。")
+            return
+        port = self.cbo_port.get().strip()
+        if not port:
+            messagebox.showwarning("未选端口",
+                                   "先在顶部连接 ESP32 桥的串口，或手动在顶部填入端口。")
+            return
+        # 这些都要在主线程读（Tk 变量不能在子线程碰）
+        et = self._resolve_esptool()
+        chip = self._chip_arg()
+        baud = self.flash_baud.get().strip()
+        # 本程序自己开着串口时 esptool 必然打不开（PermissionError 13），
+        # 必须先断开；端口句柄在 Windows 上释放略滞后，留一点时间给它。
+        reconnect = self.ser is not None
+        if reconnect:
+            self.close_port()
+            self._flash_print("[提示] 已断开上位机串口，交给 esptool 独占。\n")
+            time.sleep(0.4)
+        base = [i["dev"] for i in self._list_ports()]
+        self._flash_running = True
+        threading.Thread(target=self._flash_run,
+                         args=(et, chip, port, baud, fw, reconnect, base),
+                         daemon=True).start()
+
+    def _exec_esptool(self, cmd, ui, flag):
+        """跑一次 esptool，边跑边把输出推到日志。返回 (返回码, 全部输出)。
+
+        返回码 -1 表示进程压根没起来（找不到 esptool / 启动异常），
+        调用方据此区分「连不上芯片」和「环境没装好」。
+        """
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    bufsize=1, creationflags=flag)
+        except FileNotFoundError:
+            ui.put(lambda: self._flash_print(
+                "[错误] 找不到 esptool。请先安装：pip install -U esptool\n"))
+            return (-1, "FileNotFoundError")
+        except Exception as e:
+            ui.put(lambda: self._flash_print("[启动失败] %s\n" % e))
+            return (-1, str(e))
+        out = []
+        rc = None
+        # 4MB @921600 正常 1~2 分钟，给 15 分钟兜底，避免卡死后再也点不动按钮
+        killer = threading.Timer(900.0, self._kill_quiet, args=(proc,))
+        killer.daemon = True
+        killer.start()
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    out.append(line)
+                    ui.put(lambda l=line: self._flash_insert(l.rstrip("\r\n") + "\n"))
+            rc = proc.wait()
+        except Exception:
+            pass
+        finally:
+            killer.cancel()
+        return (rc, "".join(out))
+
+    def _flash_run(self, et, chip, port, baud, fw, reconnect, base):
+        flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        ui = self.ui_q          # 子线程一律走队列，直接碰 Tk 会崩
+
+        # ① 先让固件自己重启进 ROM 下载模式。
+        #    桥接固件是 TinyUSB 复合 USB，PID 也是 0x1001，esptool 会误判成
+        #    硬件 USB-JTAG 口、用 JTAG 控制请求去复位（TinyUSB 不响应），
+        #    结果就是 "No serial data received"、只能手按 BOOT。
+        new_port = self._soft_enter_boot(port, ui)
+        if new_port:
+            no_reset = True
+            if new_port != port:
+                port = new_port
+                ui.put(lambda p=port: self._set_port(p))
+            ui.put(lambda p=port: self._flash_print(
+                "[软复位] 已进 ROM 下载模式，端口 %s（无需按 BOOT）\n" % p))
+        else:
+            no_reset = False
+        cmd = self._esptool_cmd(et, chip, port, baud, fw, no_reset)
+        ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
+        rc, txt = self._exec_esptool(cmd, ui, flag)
+
+        # 兜底重试：软复位判定成功、esptool 却仍连不上——多半是端口刚枚举出来
+        # 还没就绪，或 Windows 因为竞态临时给了个旧口。再复位一次重试一遍。
+        low = txt.lower()
+        if (rc not in (0, -1) and no_reset
+                and ("no serial data" in low or "failed to connect" in low
+                     or "wrong boot mode" in low)):
+            ui.put(lambda: self._flash_print(
+                "[重试] 第一次没连上，重新复位一次再试…\n"))
+            time.sleep(1.0)
+            again = self._soft_enter_boot(port, ui)
+            # 返回 None 表示端口没断开 —— 说明芯片本来就停在下载模式，不会再重启
+            port = again or port
+            ui.put(lambda p=port: self._set_port(p))
+            cmd = self._esptool_cmd(et, chip, port, baud, fw, True)
+            ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
+            rc, txt = self._exec_esptool(cmd, ui, flag)
+
+        self._flash_running = False
+        ui.put(lambda: self._flash_print(
+            "--- 刷写进程结束，返回码 %s ---\n" % rc))
+        if rc == 0:
+            ui.put(lambda: self._flash_print(
+                "=== 刷写成功。芯片已自动复位，正在重新连接 ===\n"))
+        else:
+            why = self._flash_fail_reason(txt)
+            if why:
+                ui.put(lambda: self._flash_print("[刷写失败] %s\n" % why))
+        # 刷完芯片会 hard reset 回 app，USB 重新枚举：下载模式那口号（可能是
+        # COM10）已经没用了，必须重扫端口再连，否则一直连不上。
+        if reconnect:
+            ui.put(lambda: self.after(900, self._after_flash_reconnect))
+        else:
+            ui.put(lambda: self.after(900, self.refresh_ports))
+
+    def _after_flash_reconnect(self):
+        """刷写结束：先重扫端口（芯片刚从下载模式切回 app），再重新连接。"""
+        try:
+            self.refresh_ports(force=True)
+        except Exception:
+            pass
+        self.toggle_conn()
+
+    def _build(self, fix_size=False):
+        # 已废弃：UI 改为左侧栏 + 四页（_build_shell / _build_pages / _show_page）。
+        # 保留签名以避免历史引用报错，实际界面由上面的分页方法构建。
+        pass
 
     def _pick_note(self, cands):
         """挑一条能在当前窗口宽度里放得下的说明文字。
@@ -2009,25 +3662,210 @@ class App(tk.Tk):
             self.canvas.configure(cursor=("arrow" if c["lock"] else "hand2"))
 
     # ------------------------------------------------------------- 串口 --
-    def refresh_ports(self):
-        """优先挑 ESP32-S3 的 USB CDC 口（VID 303A），其次最后一个串口"""
-        ports, best = [], None
-        if serial is not None:
+    def _list_ports(self):
+        """枚举串口，带上「是不是乐鑫芯片」「USB 序列号」两个判据。
+
+        注意 VID:PID=303A:1001 是 ESP32-S3 原生 USB-Serial-JTAG 的口，
+        S3 / C3 / C6 全都这个号，**光看 VID 分不出是哪块板**，
+        所以序列号（p.serial_number）才是识别同一块芯片的可靠依据。
+        """
+        out = []
+        if serial is None:
+            return out
+        try:
+            for p in serial.tools.list_ports.comports():
+                desc = p.description or ""
+                hwid = p.hwid or ""
+                blob = (desc + " " + hwid).upper()
+                ser = (getattr(p, "serial_number", "") or "").strip()
+                out.append({
+                    "dev": p.device,
+                    "desc": desc,
+                    "hwid": hwid,
+                    "ser": ser,
+                    "loc": (getattr(p, "location", "") or ""),
+                    "esp": ("303A" in blob) or ("ESPRESSIF" in blob),
+                })
+        except Exception:
+            pass
+        out.sort(key=lambda i: com_num(i["dev"]))
+        return out
+
+    @staticmethod
+    def _bridge_ping(dev, timeout=0.9):
+        """跟串口上的固件握一次手：发 INFO，看是否回 OK INFO。
+
+        只有我们的桥固件会回这一行，别的 ESP32 板子（哪怕同型号）不会，
+        这是唯一能百分百分出「哪块是我们的桥」的判据。
+        返回 (是否命中, 该口序列号)。
+        """
+        if serial is None:
+            return False, ""
+        try:
+            s = serial.Serial(dev, 115200, timeout=0.1, write_timeout=0.3)
+        except Exception:
+            return False, ""
+        ser = ""
+        try:
+            # DTR 必须拉高：这块 S3 走 USB CDC，DTR 为低时固件当主机没连上，
+            # Serial 的输出会被直接丢掉，回包一个字节都收不到。
+            # RTS 保持低，避免被当成复位/下载握手信号。
             try:
-                for p in serial.tools.list_ports.comports():
-                    ports.append(p.device)
-                    desc = (p.description or "") + (p.hwid or "")
-                    if "303A" in desc.upper() or "ESPRESSIF" in desc.upper():
-                        best = p.device
+                s.dtr = True
+                s.rts = False
             except Exception:
                 pass
-        ports.sort()
-        if ports:
-            pick = best or ports[-1]
-            if self.cbo_port.get() != pick:
+            try:
+                s.reset_input_buffer()
+            except Exception:
+                pass
+            s.write(b"INFO\r\n")
+            t0 = time.time()
+            buf = b""
+            while time.time() - t0 < timeout:
+                try:
+                    chunk = s.read(128)
+                except Exception:
+                    break
+                if chunk:
+                    buf += chunk
+                    if b"OK INFO" in buf:
+                        return True, ser
+            return False, ser
+        except Exception:
+            return False, ser
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _probe_async(self, cands, prefer=None):
+        """多个 ESP32 候选时，后台逐个握手定夺，不卡界面。
+
+        `prefer` 是当前最可能正确的口（记忆/手选/枚举首选），排到队首先问，
+        通常一次 0.1 秒就能确认，不必先等另一块板子超时 1 秒。
+        """
+        if getattr(self, "_probing", False) or self.ser is not None:
+            return
+        order = list(cands)
+        if prefer:
+            order.sort(key=lambda i: 0 if i["dev"] == prefer else 1)
+        self._probing = True
+
+        def work():
+            hit = None
+            try:
+                for info in order:
+                    if self.ser is not None:      # 用户中途自己连上了就收手
+                        break
+                    ok, _ = self._bridge_ping(info["dev"])
+                    if ok:
+                        hit = info
+                        break
+            finally:
+                # 必须放 finally：探测线程若异常退出而不复位，界面会永久停在
+                # 「正在确认」状态，之后每次扫端口都不再做握手
+                self._probing = False
+            if hit is not None:
+                self.ui_q.put(lambda: self._on_probe_hit(hit))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_probe_hit(self, info):
+        # 用户手填过并且填的是候选之一，就别抢他的选择
+        typed = self.cbo_port.get().strip()
+        if getattr(self, "_port_user_locked", False) and typed:
+            return
+        self._set_port(info["dev"])
+        write_port_pref(ser=info["ser"], port=info["dev"], desc=info["desc"])
+        self._hint("已选 %s（桥接板已回应 OK INFO）" % info["dev"])
+
+    def _set_port(self, dev):
+        try:
+            if self.cbo_port.get().strip() != dev:
                 self.cbo_port.delete(0, "end")
-                self.cbo_port.insert(0, pick)
-        return ports
+                self.cbo_port.insert(0, dev)
+        except Exception:
+            pass
+
+    def _on_port_typed(self, _ev=None):
+        """用户手改串口 -> 标记为「手选」，后续扫端口不覆盖。"""
+        self._port_user_locked = True
+
+    def _remember_port(self, dev):
+        """把成功连通的串口和芯片序列号记下来，下次优先认同一块板。"""
+        for i in self._list_ports():
+            if i["dev"] == dev:
+                write_port_pref(ser=i["ser"], port=dev, desc=i["desc"])
+                return
+        write_port_pref(port=dev)
+
+    def _hint(self, text):
+        """顶部右侧的一次性提示（端口判定结果 / 热键说明都用它）。"""
+        try:
+            self.lbl_hint.configure(text=text)
+        except Exception:
+            pass
+
+    def refresh_ports(self, force=False):
+        """挑串口。五级判定，用来区分同机多块同型号 ESP32：
+
+        ① 用户手选过且该口还在 —— 尊重（**点「扫端口」时作废，强制重判**）；
+        ② 记住上次握手成功的芯片序列号 —— 跟芯片走，换 USB 口也认得出；
+        ③ 唯一一个乐鑫口 —— 直接用它；
+        ④ 多个乐鑫口 —— 先给临时值（取端口号最大的，通常是刚插的那块），
+           同时后台逐个握手，只认回 OK INFO 的那块（同型号板不会回）；
+        ⑤ 都不是乐鑫口 —— 按 COM 数字取最大的（不是字符串排序）。
+
+        force=True 是用户主动点「扫端口」：必须清掉手选锁，否则用户手打过一次
+        端口之后就永远停在旧值、看起来像「扫描没用」。
+        """
+        if force:
+            self._port_user_locked = False
+        infos = self._list_ports()
+        devices = [i["dev"] for i in infos]
+        if not devices:
+            self._hint("没扫到串口，检查 USB 是直连还是仅供电")
+            return []
+        esp = [i for i in infos if i["esp"]]
+        pref = read_port_pref()
+        cur = self.cbo_port.get().strip()
+        pick, why = None, ""
+        ser_hit = False
+
+        locked = bool(cur and getattr(self, "_port_user_locked", False)
+                      and cur in devices)
+        if locked:
+            pick, why = cur, "手选"                            # ①
+        if pick is None and pref.get("ser"):                   # ②
+            for i in esp:
+                if i["ser"] and i["ser"] == pref["ser"]:
+                    pick, why, ser_hit = i["dev"], "序列号记忆", True
+                    break
+        if pick is None and len(esp) == 1:                     # ③
+            pick, why = esp[0]["dev"], "唯一乐鑫口"
+        if pick is None:                                       # ④ / ⑤
+            if pref.get("port") in devices:
+                pick, why = pref["port"], "上次用过的口"
+            elif esp:
+                pick, why = esp[-1]["dev"], "多个乐鑫口，后台确认中"
+            else:
+                pick, why = devices[-1], "端口号最大"
+
+        if self.ser is not None:
+            # 已连接时改端口只会让界面和实际连接对不上，先提示断开
+            self._hint("已连接 %s，要换口请先点「断开」" % (cur or "?"))
+            return devices
+
+        self._set_port(pick)
+        self._hint("已选 %s（%s）" % (pick, why))
+
+        # 手选的口不再探测（用户已经明确指定，别去串口上乱发 INFO）；
+        # 序列号已认出也不用问。只有「多乐鑫口 + 毫无依据」才值得握手。
+        if len(esp) > 1 and not ser_hit and not locked:
+            self._probe_async(esp, pick)
+        return devices
 
     def toggle_conn(self):
         if self.ser is not None:
@@ -2048,9 +3886,17 @@ class App(tk.Tk):
             return
         self.lbl_status.configure(text="已连接 " + port, fg=ACCENT)
         self.btn_conn.configure(text="断开")
+        self.lbl_hint.configure(text="")
+        # 连上了就把这块芯片的序列号记住，下次插别的 USB 口也认得它
+        self._remember_port(port)
+        self._flash_print(
+            "\n=== 已连接 %s —— 下面是串口实时输出，按一下遥控器会出现 # KEY 行 ===\n"
+            % port)
         threading.Thread(target=self._reader, daemon=True).start()
         self.send("INFO")
         self.after(150, lambda: self.cmd_list(False))
+        # 连接成功即自动初始化并重抓硬件信息（清空旧指纹 + 重新抓取，隐私不残留）
+        self.after(300, self._hw_refresh)
 
     def close_port(self):
         try:
@@ -2098,10 +3944,29 @@ class App(tk.Tk):
                 self._handle(self.rx_q.get_nowait())
         except queue.Empty:
             pass
+        # 子线程不能直接碰 Tk（after 也不行，会撞 "main thread is not in main loop"），
+        # 统一丢进队列，由这里在主线程执行。
+        try:
+            while True:
+                fn = self.ui_q.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
         self.after(60, self._drain)
 
     def _handle(self, line):
-        if not line or line.startswith("#"):
+        # 硬件信息页「重新抓取」期间，把所有行收进临时缓冲，供解析用
+        if self._cap_active:
+            self._cap.append(line)
+        if not line:
+            return
+        # 调试日志：串口收到的每一行都带时间戳镜像到页4，按键报告 R / OK STAT
+        # 这些原本解析完就丢了，页4 看不到任何实时输出。
+        self._flash_rx(line)
+        if line.startswith("#"):
             return
         if line.startswith("B "):
             p = line.split()

@@ -12,11 +12,16 @@ build/
 dist/
 pc/build_new/
 pc/dist_new/
+pc/build_onefile/
+pc/dist_onefile/
 *.exe
 
 # ---- 运行时 / 用户数据 ----
 remotekey.ini
 logs/
+pc/*.log
+pc/bridge_port.json
+pc/bridge_info.txt
 
 # ---- 逆向原始材料（体积大、含个人设备与抓包，按需自行保留）----
 bugout/
@@ -32,6 +37,9 @@ btsnoop*.log
 
 # ---- 固件构建输出 ----
 firmware/**/build/
+# arduino-cli --build-path 或 --build-property build.path 产生的中间目录
+firmware/**/.build/
+firmware/**/compile.log
 # arduino-cli --build-path build_xxx
 firmware/**/build_*/
 # 改参数前的源码备份

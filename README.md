@@ -93,15 +93,16 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 ### 1. 烧固件
 
-仓库里保留了三版固件，按需要选一个（都保留，不会互相影响）：
+仓库里保留了四版固件，按需要选一个（都保留，不会互相影响）：
 
 | 目录 | 说明 |
 |---|---|
-| `firmware/cmcc_s3_bridge_v4voice_20261031_2226/` | **推荐**。自动识别 + **打开语音通道**，语音键能录音。要本地语音转文字就用这一版 |
+| `firmware/cmcc_s3_bridge_v4voice_20261103_2324/` | **推荐**。Release 附件就是这一版：在 v4 基础上让固件自报构建名（`OK INFO name=`），`REPORTS` 的订阅状态改为真实值。语音链路同 v4 |
+| `firmware/cmcc_s3_bridge_v4voice_20261031_2226/` | 语音通道首发版，功能与上一版一致，只是不上报构建名 |
 | `firmware/cmcc_s3_bridge_v3auto_20261029_0051/` | 只有按键，不订阅语音通道。不用语音功能就用它 |
 | `firmware/cmcc_s3_bridge/` | 最早一版。`TARGET_ADDR` 写死了一只遥控器的 MAC，换设备要改一行重烧 |
 
-三者的串口命令、NVS 映射表格式完全一致，`remotekey.ini` 也可以直接通用，可以随时换。
+各版本的串口命令、NVS 映射表格式完全一致，`remotekey.ini` 也可以直接通用，可以随时换。
 从旧版本升级只烧 app（`0x10000`）即可，NVS 不动，已经调好的映射一条都不会丢。
 
 用 Arduino IDE 打开对应目录里的 `.ino`：
@@ -115,14 +116,18 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 ```bash
 FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc"
-arduino-cli compile --fqbn "$FQBN" firmware/cmcc_s3_bridge_v4voice_20261031_2226
-arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v4voice_20261031_2226
+arduino-cli compile --fqbn "$FQBN" firmware/cmcc_s3_bridge_v4voice_20261103_2324
+arduino-cli upload  --fqbn "$FQBN" -p COM11 firmware/cmcc_s3_bridge_v4voice_20261103_2324
 ```
 
 > **`upload` 报 `No serial data received` 是正常的。** S3 的 USB 口走 USB Serial/JTAG +
 > TinyUSB CDC，不响应 esptool 的标准复位序列。先让它进下载模式再传，三种办法任选：
 > 串口发 `BOOT`（固件自带，最省事）、拨 1200 波特率触发、
 > 或手动按住 **BOOT** 再点 **RST**。见 [`docs/build.md`](docs/build.md)。
+
+> **用上位机烧录页就不用管这些。** 点「检测芯片」或「开始刷写」时，程序会先向串口发一次
+> **1200 bps** 的 line coding，固件收到后自己重启进 ROM 下载模式（等效按 BOOT），
+> 用完再自己切回 app。实测在这块板上 DTR/RTS 序列无效，1200 bps 才有效（1.3.0 起）。
 
 **v4 / v3 都不需要改 MAC。** 第一次连上会把遥控器地址记进 NVS，之后开机直接找它。
 换另一只遥控器时要先清掉旧地址：串口发 `TARGET CLEAR`。
@@ -145,11 +150,12 @@ static const char *TARGET_ADDR = "0c:f3:cc:63:10:e3";   // 改成你自己遥控
 
 两种方式，任选：
 
-**A. 直接用绿色版**（不需要装 Python、不用配环境）
+**A. 直接用发布包**（不需要装 Python、不用配环境）
 
 到 [Releases](https://github.com/jackielozet/cmcc-voice-remote-bridge/releases) 下载
-`CMCC_RC_Keys_1.2.0_win64.zip`，解压到**有写权限**的目录（别放 `C:\Program Files`），
-双击里面的 `CMCC_RC_Keys.exe`。识别模型和解码器都在包里，Win10 / Win11 64 位开箱可用。
+`CMCC_RC_Keys_1.3.0.exe`（单文件，约 111 MB），放到**有写权限**的目录
+（别放 `C:\Program Files`），双击即用。识别模型和解码器都收在这一个 exe 里，
+Win10 / Win11 64 位开箱可用。单文件首次启动要解压到 `%TEMP%`，冷启动约 3–5 秒。
 
 **B. 跑源码**
 
@@ -164,7 +170,7 @@ python pc/remote_ui.py
 
 ## 改键：图形界面
 
-主界面把遥控器照片当背景，每个键引一条线到左右两侧的文本框，框里就是它当前的动作。
+「按键映射」页把遥控器照片当背景，每个键引一条线到左右两侧的文本框，框里就是它当前的动作。
 点文本框弹出录键窗：
 
 ![改键弹窗](docs/images/key-dialog.png)
@@ -184,7 +190,7 @@ python pc/remote_ui.py
 
 ## 语音转文字（1.2.0 新增）
 
-勾选界面第二行的 **「勾选后语音键录音并直接输出文字」**，把光标放进任意输入框，
+切到「语音方案」页，勾选 **「勾选后语音键录音并直接输出文字」**，把光标放进任意输入框，
 **按住**遥控器语音键说话、**松手**，文字就上屏了。
 
 - 全程**本地离线**：sherpa-onnx + Paraformer 中文模型，不联网、不上传、不占系统麦克风；
@@ -458,6 +464,11 @@ push the table back over the serial port.
 
 **Highlights**
 
+- **Refactored UI (1.3.0)**: a left sidebar with four pages — hardware info, key mapping, voice, and
+  firmware flashing. The flashing page probes the chip and writes the image **without pressing BOOT**:
+  it sends a 1200 bps line coding, which makes `USBCDC` run `usb_persist_restart(RESTART_BOOTLOADER)`
+  and re-enumerate as USB-Serial/JTAG. A DTR/RTS sequence does nothing on this board (measured, not
+  assumed); the old failure `PermissionError(13)` was the tool itself still holding the port.
 - `Win+D`, `Win+E`, `Alt+Tab` are swallowed while recording, so chords can be captured intact;
   `Win+L` cannot be hooked by design (it is a protected system action), so the recorder offers a
   one-click preset and an opt-in elevated mode that temporarily disables the lock policy and always
