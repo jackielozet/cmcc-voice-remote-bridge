@@ -9,10 +9,15 @@
 
 ---
 
-## 一、PC 端 CMCC_RC_Keys 1.3.0
+## 一、PC 端 CMCC_RC_Keys 1.3.1
 
 | 组件 | 版本 | 许可证 | 在本项目里干什么 |
 |---|---|---|---|
+| [esptool](https://github.com/espressif/esptool) | 5.6.0 | **GPL-2.0-or-later** | 刷固件 / 读芯片型号（1.3.1 起内嵌，见下「2. esptool 内嵌带来的许可冲突」） |
+| [rich](https://github.com/Textualize/rich) | 15.0.0 | MIT | esptool 的终端输出 |
+| [click](https://github.com/pallets/click) / rich-click | 8.5.0 / 1.9.9 | BSD-3-Clause / MIT | esptool 的命令行解析 |
+| [cryptography](https://github.com/pyca/cryptography) | 50.0.2 | Apache-2.0 OR BSD-3-Clause | esptool 的加密镜像支持 |
+| [reedsolo](https://github.com/tomerfiliba-org/reedsolomon) | 1.7.0 | MIT | esptool 的 ECC 校验 |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 2.0.1 | Apache-2.0 | 离线语音识别框架（`sherpa_onnx/`） |
 | [onnxruntime](https://github.com/microsoft/onnxruntime) | 1.28.2 | MIT | 推理运行时，随 sherpa-onnx 以 `onnxruntime.dll` 分发 |
 | Paraformer-zh-small 模型权重 | 2024-03-09 | **未声明**（见下） | 语音识别模型 `model.int8.onnx`（78 MB） |
@@ -70,6 +75,27 @@ libg722_1 的 `COPYING` 原文：
 
 即：**Polycom 持有相关专利，符合其基本条件者可获得免版税许可**。项目按"随程序提供、
 默认不启用商业分发"的方式使用；若要商用，请先向 Polycom 确认许可条件。
+
+### 4. esptool 内嵌带来的许可冲突（1.3.1 起）
+
+1.3.1 为了解决「目标机没装 esptool 就刷不了固件」，把 esptool 5.6.0 打进了 exe，
+在**同一进程内** `import esptool` 调用。这跟 `decode.exe` 的处理方式不同：
+
+| | `decode.exe`（1.2.0 起） | 内嵌 esptool（1.3.1 起） |
+|---|---|---|
+| 运行方式 | 独立进程，`subprocess` 调用、文件通信 | 与本程序同一进程、同一地址空间 |
+| GPL 传染 | 不传染（聚合而非衍生） | **传染**：整个 exe 视为衍生作品 |
+| 对仓库 LICENSE 的影响 | 无 | 与当前 MIT 冲突 |
+
+**现状如实记录**：仓库 `LICENSE` 仍是 MIT，而分发的 exe 里含 GPL-2.0 的 esptool。
+两者不兼容。自用、内部测试无实际风险；**对外分发前需要二选一**：
+
+1. 把 `LICENSE` 改成 GPL-2.0（最省事，源码本来就在这个仓库公开，满足 GPL 的源码提供义务）；
+2. 把 esptool 单独打成 `esptool.exe`，主程序用 `subprocess` 调用它（与 `decode.exe` 同款
+   隔离方式，GPL 不传染），代价是 Release 多一个附件、程序要能定位到它。
+
+代码里已经预留了第 2 条的路径：`_resolve_esptool()` 优先找外部 `esptool.exe`（`PATH`、
+程序所在目录、常见 pip 安装位置），只有找不到时才用内嵌那份。
 
 ---
 

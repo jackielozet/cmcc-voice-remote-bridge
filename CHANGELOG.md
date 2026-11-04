@@ -2,6 +2,47 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.3.1] - 2026-11-04
+
+修 1.3.0 里「换台电脑就刷不了固件」的三处问题。**串口命令、NVS 映射表、`remotekey.ini` 都没动**，
+只换上位机。
+
+### 修复
+
+- **刷固件时凭空多出一个上位机窗口**：找不到外部 esptool 时，1.3.0 用
+  `[sys.executable, "-m", "esptool"]` 兜底。单文件 exe 的 `sys.executable` 就是它自己，
+  于是变成**再启动一个上位机**——新实例不认识 `-m esptool`，只管开着窗口不退出，
+  原进程读到 EOF 后一直等到 75 秒超时，判定「连不上芯片」。目标机没装 esptool 时 100% 触发。
+  现在把 **esptool 5.6 打进 exe**，在本进程里调 `esptool._main()`，不再启动任何进程
+  （`esptool.main()` 不行，它会把 `SerialTimeoutException` 直接抛出来、绕过错误提示）。
+- **换台电脑 COM 号不是 COM10 就认不出下载模式**：1.3.0 要求「原端口先消失」，再按
+  `COM11 → COM10` 这种固定关系去找，换台电脑口号一变就卡死。现在三条硬证据任一成立即可：
+  ① 同 USB 位置出现**另一个**口号；② 原口号还在、但接口号从 `.1` 变成 `.0`；
+  ③ 原口号消失、且冒出一个之前没见过的乐鑫口。兜底（全场唯一乐鑫口）还要求它
+  要么是新出现的、要么就在原 USB 位置上，免得插两块板时连到别人板上。
+- **进下载模式后仍 `Write timeout`**：1.3.0 对已在下载模式的芯片强制 `--before no_reset`，
+  实测是错的。这块板进下载模式后是 USB-Serial/JTAG 口，esptool 自己的 `USBJTAGSerialReset`
+  有效（实测 0.6–0.7 秒连上），跳过握手反而写不进去。现在一律走 esptool 默认复位。
+- **刷完 / 检测完连不回设备**：这块板的 USB-JTAG 不吃任何软件复位（RTS 脉冲、DTR 脉冲、
+  esptool 的 `run`、USB-JTAG 专用序列全试过，芯片一律留在下载模式）。
+  现在检测/刷写结束先找**运行态端口**（接口 `.1`）重连，找不到就明确写
+  「拔插一次 USB」，不再拿下载模式的口号去连、也不再弹「打开失败」。
+
+### 变更
+
+- 刷写页提示里的「实测 COM11 → COM10」删掉了 —— 口号是 Windows 分的，换台电脑就变
+- 新增 `--selftest-esptool COMx`：用内嵌 esptool 读一次芯片型号，结果写 `esptool_selftest.txt`。
+  目标机刷不了时让用户跑这个，能分清是 esptool 环境问题还是端口/硬件问题
+- `--diag` 增加 `esptool` / `esptool ext` 两行（内嵌版本、外部是否装了）
+- 环境变量 `CMCC_NO_EXT_ESPTOOL=1` 可强制走内嵌路径（排障用）
+- exe 体积 111 MB → 126 MB（内嵌 esptool + rich + cryptography）
+
+### 注意：许可证
+
+**esptool 是 GPL-2.0**。打进 exe 后整个 exe 按 GPL-2.0 分发，与仓库当前的 MIT 许可不兼容。
+自用无所谓；**对外分发前需要二选一**：把 LICENSE 改成 GPL-2.0，或把 esptool 拆成独立的
+`esptool.exe` 由主程序调用（进程隔离，GPL 不传染，代价是 Release 多一个附件）。
+
 ## [1.3.0] - 2026-11-04
 
 界面重构成左侧导航的四个页面，**刷固件不用再按 BOOT 键**：上位机自己发一次 1200 bps touch

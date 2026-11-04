@@ -13,6 +13,7 @@ CMCC 语音遥控器 —— 按键映射设置（图形版 / 绿色主题 / 免�
   设备主动上报： B <id> <type> <n> <k...>（绑定行）、# 开头的日志
 """
 import ctypes
+import io
 import os
 import queue
 import sys
@@ -109,12 +110,13 @@ init_metrics()
 SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
 
-APP_VER = "1.3.0"
+APP_VER = "1.3.1"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
 
 # 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
 # 加版本时只往这里加一行，界面不用改。
 APP_VER_LOG = [
+    "20261104：v1.3.1-修复换机后刷不了固件",
     "20261104：v1.3.0-重构UI",
 ]
 
@@ -2711,8 +2713,8 @@ class App(tk.Tk):
             "就绪。固件默认指向程序所在文件夹，点「浏览」从该目录选 .bin。\n"
             "点「开始刷写」即可，程序会自动让芯片进下载模式（1200bps touch，等效按 BOOT）。\n"
             "· 自动复位失败时才需要手动：按住 BOOT 不放 → 点一下 EN → 松开 BOOT。\n"
-            "· 进下载模式后 COM 号会变（实测 COM11 → COM10），程序会自动跟上；\n"
-            "  手动刷时可点「扫端口」重新识别。\n"
+            "· 进下载模式后 COM 号会变（换台电脑就可能是别的号），程序按 USB 位置\n"
+            "  自动认新端口，不用管它是 COM 几；\n"
             "· merged.bin 从 0x0 整片写入会清掉 NVS 里的按键映射，刷前先在按键页\n"
             "  点「从设备读取」把映射读出来备份。\n"
             "日志实时滚屏，可「保存日志」导出。\n")
@@ -2851,7 +2853,8 @@ class App(tk.Tk):
                 "检测芯片",
                 "将用 esptool 直连 %s 读取芯片型号。\n"
                 "程序会先发 1200bps touch 让芯片自动进下载模式（不用按 BOOT），\n"
-                "期间串口被独占、遥控器桥接中断约 5~10 秒，检测完自动重连。\n\n"
+                "期间串口被独占、遥控器桥接中断约 5~10 秒。\n"
+                "检测完会自动找端口重连；若板子留在下载模式，拔插一次 USB 即可。\n\n"
                 "继续？" % port):
             return
         reconnect = self.ser is not None
@@ -2977,46 +2980,18 @@ class App(tk.Tk):
             et = self._resolve_esptool()
             # 桥接板运行态是 TinyUSB 复合 USB，PID 也是 0x1001，esptool 会误判成
             # 硬件 USB-JTAG 口、发 JTAG 控制请求（TinyUSB 不响应）→ 永远连不上。
-            # 先 1200bps touch 让它自己进 ROM 下载模式，端口号会变。
+            # 先 1200bps touch 让它自己进 ROM 下载模式，端口号会变（号码不固定）。
             new_port = self._soft_enter_boot(port, ui)
             if new_port:
                 port = new_port
                 ui.put(lambda p=port: self._set_port(p))
-                ui.put(lambda p=port: self._flash_print(
-                    "[检测] 芯片已进下载模式，端口 %s\n" % p))
-                pre = ["--before", "no_reset"]
-            else:
-                pre = []
             # v5 起 chip_id 改名 chip-id（旧名仅打 DEPRECATED 警告仍会跑），
             # 所以先试新名，报 invalid choice 才退回旧名。
             for sub in ("chip-id", "chip_id"):
-                cmd = et + ["--port", port] + pre + [sub]
-                ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
-                try:
-                    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, text=True,
-                                            bufsize=1, creationflags=flag)
-                except FileNotFoundError:
-                    ui.put(lambda: self._flash_print(
-                        "[错误] 找不到 esptool。请先安装：pip install -U esptool\n"))
-                    return
-                out = []
-                killer = threading.Timer(75.0, self._kill_quiet, args=(proc,))
-                killer.daemon = True
-                killer.start()
-                try:
-                    if proc.stdout:
-                        for line in proc.stdout:
-                            out.append(line)
-                            ui.put(lambda l=line: self._flash_insert(
-                                l.rstrip("\r\n") + "\n"))
-                    proc.wait()
-                finally:
-                    killer.cancel()
-                last = "".join(out)
+                rc, txt = self._run_esptool(["--port", port, sub], et, ui, 75.0)
+                last = txt
                 chip = self._parse_chip(last)
-                if chip:
+                if chip or rc == -1:
                     break
                 if not re.search(r"invalid choice|unrecognized|unknown command|no such",
                                  last, re.I):
@@ -3045,10 +3020,9 @@ class App(tk.Tk):
                 "  手动兜底：按住 BOOT → 点一下 EN → 松开 BOOT，再点「扫端口」后重试。\n"))
             ui.put(lambda: self._flash_print(
                 "  提示：芯片栏已保留固件镜像里读到的型号，不影响按镜像刷写。\n"))
-        # 检测完 esptool 会把芯片 hard reset 回 app，端口重新枚举回原号，
-        # 所以先重扫再连，别拿下载模式那个口号去连。
-        ui.put(lambda: self.after(800, self._after_flash_reconnect
-                                  if reconnect else self.refresh_ports))
+        # 检测完芯片大概率还停在下载模式（这块板软复位回不到 app），
+        # 统一交给 _after_flash_reconnect 判断该重连还是该提示拔插。
+        ui.put(lambda: self.after(800, self._after_flash_reconnect))
 
     def _flash_insert(self, text, tag=None):
         try:
@@ -3126,15 +3100,23 @@ class App(tk.Tk):
             self._flash_print("[保存失败] %s\n" % e)
 
     def _resolve_esptool(self):
-        """找 esptool：PATH → 程序目录 → 常见 pip 安装位置 → 当前解释器 -m。
+        """找**外部** esptool 程序：`PATH` → 程序目录 → 常见 pip 安装位置。
 
-        打包成单文件 exe 发到干净机器时 PATH 里通常没有 esptool，只在 PATH 里找
-        会直接报「找不到 esptool」。这里再扫几个标准落地位置；只缓存真正找到文件
-        的结果，用户中途安装后下次点击仍能重新发现。
+        返回命令前缀（`[exe]`），找不到返回 `[]` —— 空列表表示改用**进程内**
+        esptool（打包进 exe 的那份），而不是拿 `sys.executable` 去当 Python 使。
+        这一点是 1.3.0 的翻车点：单文件 exe 下 `sys.executable` 就是它自己，
+        `[sys.executable, "-m", "esptool"]` 等于**再开一个上位机窗口**，
+        既不刷机也不退出，只能等超时被杀。目标机上没装 esptool 时 100% 触发。
+
+        只缓存真正找到文件的结果，用户中途安装后下次点击仍能重新发现。
         """
         cached = getattr(self, "_esptool_cached", None)
         if cached:
             return list(cached)
+        # 排障用：强制走内嵌那条路（目标机没装 esptool 时就是这条路）
+        if os.environ.get("CMCC_NO_EXT_ESPTOOL"):
+            self._esptool_cached = []
+            return []
         for name in ("esptool", "esptool.exe", "esptool.py"):
             pp = shutil.which(name)
             if pp:
@@ -3164,13 +3146,39 @@ class App(tk.Tk):
                     return [p]
             except Exception:
                 continue
-        return [sys.executable, "-m", "esptool"]
+        # 没装外部 esptool：走进程内。只有「跑源码 + 当前解释器确实装了 esptool」
+        # 这一种情况才用 -m，且必须不是 frozen（打包后 sys.executable 是 exe 自己）。
+        if not getattr(sys, "frozen", False):
+            try:
+                import importlib.util
+                if importlib.util.find_spec("esptool") is not None:
+                    self._esptool_cached = [sys.executable, "-m", "esptool"]
+                    return list(self._esptool_cached)
+            except Exception:
+                pass
+        self._esptool_cached = []
+        return []
 
-    def _esptool_cmd(self, et, chip, port, baud, fw, no_reset=False):
-        """拼写刷写命令。no_reset=True 用于「芯片已被本程序软复位进下载模式」。"""
+    def _esptool_label(self, et):
+        """日志里显示用的 esptool 名字。"""
+        if et:
+            return et[0]
+        try:
+            import esptool as _e
+            return "内嵌 esptool %s" % getattr(_e, "__version__", "?")
+        except Exception:
+            return "内嵌 esptool"
+
+    def _esptool_cmd(self, et, chip, port, baud, fw, before=None):
+        """拼刷写参数。before 一般留空走 esptool 默认复位。
+
+        1.3.0 曾对「已进下载模式」的芯片强制 `--before no_reset`，实测反而是错的：
+        这块板进下载模式后是 USB-Serial/JTAG 口，esptool 自己的 `USBJTAGSerialReset`
+        是有效的（0.6 秒连上），而 no_reset 跳过握手直接发命令 → `Write timeout`。
+        """
         cmd = list(et) + ["--chip", chip, "--port", port, "--baud", baud]
-        if no_reset:
-            cmd += ["--before", "no_reset"]
+        if before:
+            cmd += ["--before", before]
         return cmd + ["write_flash", "0x0", fw]
 
     @staticmethod
@@ -3224,52 +3232,42 @@ class App(tk.Tk):
         **实测结论（2026-11-04）**：DTR/RTS 四步序列在这块板上完全无效（信号线
         回读正确、固件毫无反应）；1200bps 才有效，且设备会重新枚举。
 
-        判定「真的复位了」的唯一硬证据是 **原端口从列表里消失**。只看「同一 USB
-        位置上还有个口」会误判：复位前后都叫 COM11 的那一瞬间就会被当成成功，
-        然后拿一个已经失效的口去刷（2026-11-04 用户实测踩过）。
+        **口号不能假设**：下载模式叫 COM 几完全由 Windows 决定，本机是 11→14，
+        换台电脑可能是 7→3。所以一律按「USB 物理位置 + 接口号变化 + 新出现的
+        乐鑫口」来认，绝不写死号段，见 `_wait_boot_port`。
 
-        返回下载模式下的端口号；没复位成功返回 None。
+        返回下载模式下的端口号；没切成功返回 None（调用方退回 esptool 默认复位）。
         """
         before = self._list_ports()
         old = {i["dev"] for i in before}
-        want_loc, orig_loc = "", ""
-        for i in before:
-            if i["dev"] == port:
-                want_loc = self._loc_key(i)
-                orig_loc = self._loc_full(i)
+        orig = next((i for i in before if i["dev"] == port), None)
+        want_loc = self._loc_key(orig) if orig else ""
+        orig_loc = self._loc_full(orig) if orig else ""
 
         for attempt in range(1, tries + 1):
             if attempt > 1:
-                # 上一轮可能把口号换掉了，先在原地重新认一下
+                # 上一轮可能把口号换掉了，先按位置重新认一下再 touch
                 now = self._list_ports()
                 if port not in {i["dev"] for i in now}:
-                    for i in now:
-                        if i["esp"] and (not want_loc or self._loc_key(i) == want_loc):
-                            port = i["dev"]
-                            break
+                    cand = [i for i in now if i["esp"]
+                            and (not want_loc or self._loc_key(i) == want_loc)]
+                    if cand:
+                        port = cand[0]["dev"]
                 ui.put(lambda a=attempt: self._flash_print(
                     "[软复位] 第 %d 次尝试重新复位…\n" % a))
                 time.sleep(0.8)
             if self._touch_once(port) is None:
-                ui.put(lambda: self._flash_print(
-                    "[软复位] 打不开 %s，改用 esptool 自带复位\n" % port))
+                ui.put(lambda p=port: self._flash_print(
+                    "[软复位] 打不开 %s，改用 esptool 自带复位\n" % p))
                 return None
             ui.put(lambda a=attempt: self._flash_print(
                 "[软复位] 第 %d 次 1200bps touch 已发出，等端口重新枚举…\n" % a))
 
-            # ① 原端口必须先消失，否则说明 touch 根本没生效
-            vanished = False
-            for _ in range(20):       # 最多 5 秒
-                time.sleep(0.25)
-                if port not in {i["dev"] for i in self._list_ports()}:
-                    vanished = True
-                    break
-            if not vanished:
-                continue
-
-            # ② 找下载模式的端口
             newp = self._wait_boot_port(port, old, want_loc, orig_loc)
             if newp:
+                ui.put(lambda o=port, n=newp: self._flash_print(
+                    "[软复位] 已进下载模式：%s → %s（口号是 Windows 分的，不固定）\n"
+                    % (o, n)))
                 return newp
             ui.put(lambda: self._flash_print(
                 "[软复位] 芯片重启了但没进下载模式（接口号没变，还在 app 里）\n"))
@@ -3277,31 +3275,49 @@ class App(tk.Tk):
             "[软复位] 多次尝试仍未进下载模式，改用 esptool 自带复位\n"))
         return None
 
-    def _wait_boot_port(self, port, old, want_loc, orig_loc):
-        """等下载模式的新端口，最多 6 秒；认不出来返回 None。
+    def _wait_boot_port(self, port, old, want_loc, orig_loc, timeout=15.0):
+        """等下载模式的端口，最多 timeout 秒；认不出来返回 None。
 
-        判据按可信度排：
-          ① 同一 USB 位置上的**另一个**口号（COM11 → COM10）
-          ② 新出现的乐鑫口
-          ③ 原口号回来了、但**接口号变了**（.1 CDC → .0 USB-Serial/JTAG）
-        「原口号回来且接口号没变」只是普通重启回 app，不算成功 —— 这正是
-        2026-11-04 用户那次失败的根因（拿一个还停在 app 的 COM11 去刷）。
+        判据（任一成立即算切过去了，不要求原口号先消失 —— 换台电脑时端口
+        消失/重现的时序不一定能被 250ms 的轮询抓到）：
+          ① 原口号还在，但**接口号变了**（`1-11:x.1` CDC → `1-11:x.0` USB-Serial/JTAG）
+          ② 同一 USB 位置（`1-11`）上出现了**另一个**口号
+          ③ 原口号已经消失，且冒出一个之前没见过的乐鑫口
+        反例：原口号还在、接口号也没变 → 只是普通重启回 app，不算成功。
+
+        ③ 必须挂在「原口号已消失」之下，否则插着两块 S3 时会连到别人板上。
         """
-        for k in range(24):
+        t0 = time.time()
+        gone = False
+        while time.time() - t0 < timeout:
             now = self._list_ports()
+            devs = {i["dev"] for i in now}
+            cur = next((i for i in now if i["dev"] == port), None)
+            if cur is None:
+                gone = True
+            elif orig_loc and self._loc_full(cur) != orig_loc:
+                return port                      # ① 同口号、换了模式
             for i in now:
-                if i["esp"] and i["dev"] != port and (
-                        not want_loc or self._loc_key(i) == want_loc):
-                    return i["dev"]
-            for i in now:
-                if i["esp"] and i["dev"] not in old:
-                    return i["dev"]
-            if k >= 4:
-                for i in now:
-                    if i["dev"] == port and i["esp"]:
-                        if orig_loc and self._loc_full(i) != orig_loc:
-                            return port
+                if not i["esp"]:
+                    continue
+                if (want_loc and i["dev"] != port
+                        and self._loc_key(i) == want_loc):
+                    return i["dev"]              # ② 同位置新口号
+                if gone and i["dev"] not in old:
+                    return i["dev"]              # ③ 原口没了 + 新冒出的乐鑫口
             time.sleep(0.25)
+
+        # 兜底：原口号确实没了，全场只剩一个乐鑫口 —— 且它要么是新冒出来的、
+        # 要么在原 USB 位置上，才认。原口号自己回来但接口号没变时**不能认**，
+        # 那只是重启回 app（① 已判过），认了就会拿一个还在 app 的口去刷。
+        esp = [i for i in self._list_ports() if i["esp"]]
+        if gone and len(esp) == 1:
+            only = esp[0]
+            if only["dev"] == port:
+                if orig_loc and self._loc_full(only) != orig_loc:
+                    return port
+            elif only["dev"] not in old or (want_loc and self._loc_key(only) == want_loc):
+                return only["dev"]
         return None
 
     def _flash_start(self):
@@ -3334,8 +3350,8 @@ class App(tk.Tk):
                          args=(et, chip, port, baud, fw, reconnect, base),
                          daemon=True).start()
 
-    def _exec_esptool(self, cmd, ui, flag):
-        """跑一次 esptool，边跑边把输出推到日志。返回 (返回码, 全部输出)。
+    def _exec_esptool(self, cmd, ui, flag, timeout=900.0):
+        """跑一次**外部** esptool 程序，边跑边把输出推到日志。返回 (返回码, 全部输出)。
 
         返回码 -1 表示进程压根没起来（找不到 esptool / 启动异常），
         调用方据此区分「连不上芯片」和「环境没装好」。
@@ -3354,7 +3370,7 @@ class App(tk.Tk):
         out = []
         rc = None
         # 4MB @921600 正常 1~2 分钟，给 15 分钟兜底，避免卡死后再也点不动按钮
-        killer = threading.Timer(900.0, self._kill_quiet, args=(proc,))
+        killer = threading.Timer(timeout, self._kill_quiet, args=(proc,))
         killer.daemon = True
         killer.start()
         try:
@@ -3369,8 +3385,133 @@ class App(tk.Tk):
             killer.cancel()
         return (rc, "".join(out))
 
+    def _run_esptool(self, argv, et, ui, timeout=900.0):
+        """跑 esptool 的统一入口：有外部程序用外部，没有就用包里内嵌的那份。
+
+        `argv` 不含程序名。两条路返回同样的 `(返回码, 全部输出)`。
+        """
+        ui.put(lambda a=argv: self._flash_print(
+            ">>> esptool " + " ".join(a) + "\n"))
+        if et:
+            return self._exec_esptool(list(et) + list(argv), ui,
+                                      getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                      timeout)
+        return self._exec_esptool_inproc(argv, ui, timeout)
+
+    def _exec_esptool_inproc(self, argv, ui, timeout=900.0):
+        """在本进程里跑内嵌的 esptool（目标机没装 Python / esptool 时走这条）。
+
+        为什么不用子进程：单文件 exe 的 `sys.executable` 就是它自己，
+        1.3.0 用 `[sys.executable, "-m", "esptool"]` 的结果是**又开一个上位机**——
+        既不刷机也不退出，只能等 75 秒超时。这是 1.3.0 刷不了固件的直接原因。
+
+        改成 import 进来调 `esptool._main()`（CLI 的真正入口，内部自己捕获异常、
+        打印 "A fatal error occurred"、再 sys.exit）。注意不能用 `esptool.main()`：
+        那个是库入口，`SerialTimeoutException` 会直接抛出来。
+
+        esptool 是 GPL-2.0，随本程序分发后整个 exe 受 GPL-2.0 约束，见 docs/third-party.md。
+        """
+        try:
+            import esptool as _esp
+        except Exception as e:      # noqa: BLE001
+            ui.put(lambda: self._flash_print(
+                "[错误] 没有可用的 esptool：外部未安装，内嵌版也没打进包里。\n"
+                "  修复：在装有 Python 的机器上 pip install -U esptool，"
+                "或用带内嵌 esptool 的发布版。\n  (%s)\n" % e))
+            return (-1, "no esptool")
+
+        # 进程内的任务没法强杀：上一次超时放弃后它可能还在跑，再开一个会抢串口
+        prev = getattr(self, "_et_thread", None)
+        if prev is not None and prev.is_alive():
+            ui.put(lambda: self._flash_print(
+                "[提示] 上一次 esptool 还没结束（进程内无法中断），等它跑完再试。\n"))
+            return (-1, "busy")
+
+        class _W(io.TextIOBase):
+            """收 esptool 的所有输出。rich 检测到 isatty=False 不会上色。"""
+
+            def __init__(self):
+                self.buf = ""
+                self.lines = []
+
+            def write(self, s):
+                try:
+                    self.buf += s
+                    while "\n" in self.buf:
+                        ln, self.buf = self.buf.split("\n", 1)
+                        self.lines.append(ln)
+                except Exception:
+                    pass
+                return len(s)
+
+            def flush(self):
+                try:
+                    if self.buf:
+                        self.lines.append(self.buf)
+                        self.buf = ""
+                except Exception:
+                    pass
+
+            def isatty(self):
+                return False
+
+            @property
+            def encoding(self):
+                return "utf-8"
+
+            @property
+            def errors(self):
+                return "replace"
+
+        w = _W()
+        box = {}
+
+        def _job():
+            oo, oe, oa = sys.stdout, sys.stderr, sys.argv
+            sys.stdout = sys.stderr = w
+            sys.argv = ["esptool"] + list(argv)
+            try:
+                _esp._main()
+                box["rc"] = 0
+            except SystemExit as e:
+                box["rc"] = (e.code if isinstance(e.code, int)
+                             else (0 if e.code is None else 1))
+            except BaseException as e:      # noqa: BLE001
+                box["rc"] = 1
+                try:
+                    w.write("\n[异常] %s: %s\n" % (type(e).__name__, e))
+                except Exception:
+                    pass
+            finally:
+                try:
+                    w.flush()
+                except Exception:
+                    pass
+                sys.stdout, sys.stderr, sys.argv = oo, oe, oa
+
+        th = threading.Thread(target=_job, daemon=True)
+        self._et_thread = th
+        th.start()
+        idx = 0
+        t0 = time.time()
+        while True:
+            while idx < len(w.lines):
+                line = w.lines[idx]
+                idx += 1
+                ui.put(lambda l=line: self._flash_insert(l + "\n"))
+            if not th.is_alive():
+                w.flush()          # 把没换行结尾的最后一行也吐出来
+                if idx >= len(w.lines):
+                    break
+            if time.time() - t0 > timeout:
+                # 进程内没法强杀，只能不再等：esptool 自己的串口超时会给它收尾
+                ui.put(lambda t=int(timeout): self._flash_print(
+                    "[超时] esptool 已跑 %d 秒，先不等了（进程内无法强制结束）\n" % t))
+                break
+            time.sleep(0.05)
+        return (box.get("rc", -1), "\n".join(w.lines))
+
     def _flash_run(self, et, chip, port, baud, fw, reconnect, base):
-        flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         ui = self.ui_q          # 子线程一律走队列，直接碰 Tk 会崩
 
         # ① 先让固件自己重启进 ROM 下载模式。
@@ -3379,59 +3520,96 @@ class App(tk.Tk):
         #    结果就是 "No serial data received"、只能手按 BOOT。
         new_port = self._soft_enter_boot(port, ui)
         if new_port:
-            no_reset = True
             if new_port != port:
                 port = new_port
                 ui.put(lambda p=port: self._set_port(p))
             ui.put(lambda p=port: self._flash_print(
-                "[软复位] 已进 ROM 下载模式，端口 %s（无需按 BOOT）\n" % p))
+                "[刷写] 端口 %s，开始写入（无需按 BOOT）\n" % p))
         else:
-            no_reset = False
-        cmd = self._esptool_cmd(et, chip, port, baud, fw, no_reset)
-        ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
-        rc, txt = self._exec_esptool(cmd, ui, flag)
+            ui.put(lambda p=port: self._flash_print(
+                "[刷写] 软复位没成功，仍用 %s 试一次 esptool 自带复位\n" % p))
+        # 进下载模式后是 USB-Serial/JTAG 口，esptool 自己的 USBJTAGSerialReset
+        # 有效（实测 0.6 秒连上）；反而 `--before no_reset` 会跳过握手 → Write timeout。
+        argv = self._esptool_cmd(et, chip, port, baud, fw)
+        rc, txt = self._run_esptool(argv, et, ui, 900.0)
 
-        # 兜底重试：软复位判定成功、esptool 却仍连不上——多半是端口刚枚举出来
-        # 还没就绪，或 Windows 因为竞态临时给了个旧口。再复位一次重试一遍。
+        # 兜底重试：软复位成功、esptool 却仍连不上——多半是端口刚枚举出来
+        # 还没就绪，或 Windows 竞态临时给了个旧口。再切一次模式重来。
         low = txt.lower()
-        if (rc not in (0, -1) and no_reset
+        if (rc not in (0, -1)
                 and ("no serial data" in low or "failed to connect" in low
-                     or "wrong boot mode" in low)):
+                     or "write timeout" in low or "wrong boot mode" in low)):
             ui.put(lambda: self._flash_print(
                 "[重试] 第一次没连上，重新复位一次再试…\n"))
             time.sleep(1.0)
             again = self._soft_enter_boot(port, ui)
-            # 返回 None 表示端口没断开 —— 说明芯片本来就停在下载模式，不会再重启
             port = again or port
             ui.put(lambda p=port: self._set_port(p))
-            cmd = self._esptool_cmd(et, chip, port, baud, fw, True)
-            ui.put(lambda c=cmd: self._flash_print(">>> " + " ".join(c) + "\n"))
-            rc, txt = self._exec_esptool(cmd, ui, flag)
+            argv = self._esptool_cmd(et, chip, port, baud, fw)
+            rc, txt = self._run_esptool(argv, et, ui, 900.0)
 
         self._flash_running = False
         ui.put(lambda: self._flash_print(
             "--- 刷写进程结束，返回码 %s ---\n" % rc))
         if rc == 0:
-            ui.put(lambda: self._flash_print(
-                "=== 刷写成功。芯片已自动复位，正在重新连接 ===\n"))
+            ui.put(lambda: self._flash_print("=== 刷写成功 ===\n"))
         else:
             why = self._flash_fail_reason(txt)
             if why:
                 ui.put(lambda: self._flash_print("[刷写失败] %s\n" % why))
-        # 刷完芯片会 hard reset 回 app，USB 重新枚举：下载模式那口号（可能是
-        # COM10）已经没用了，必须重扫端口再连，否则一直连不上。
-        if reconnect:
-            ui.put(lambda: self.after(900, self._after_flash_reconnect))
-        else:
-            ui.put(lambda: self.after(900, self.refresh_ports))
+        # 刷完芯片未必回得到 app（这块板的 USB-JTAG 不吃软复位），交给
+        # _after_flash_reconnect 判断：回到 app 就重连，还停在下载模式就提示拔插。
+        ui.put(lambda: self.after(900, self._after_flash_reconnect))
 
-    def _after_flash_reconnect(self):
-        """刷写结束：先重扫端口（芯片刚从下载模式切回 app），再重新连接。"""
+    @staticmethod
+    def _is_app_port(info):
+        """这个口是不是「固件在跑」的运行态口。
+
+        桥接固件运行态是 TinyUSB CDC，出现在复合设备的接口 1（`1-11:x.1`）；
+        ROM 下载模式是 USB-Serial/JTAG，接口 0（`1-11:x.0`）。拿不到 location
+        时不敢下结论，按 app 口处理，交给后面的 INFO 握手去证伪。
+        """
+        loc = (info or {}).get("loc") or ""
+        if not loc:
+            return True
+        return not loc.endswith(":x.0")
+
+    def _after_flash_reconnect(self, tries=0):
+        """刷写/检测结束：等芯片切回运行态再连，等不到才提示拔插。
+
+        这块板（USB-Serial/JTAG）不吃软件复位，但**过几秒会自己切回 app**
+        （实测 chip-id 后约 2–6 秒端口从 `x.0` 变回 `x.1`）。所以不急着下结论，
+        先每 0.5 秒看一次，最多 12 秒。
+        """
+        infos = self._list_ports()
+        app = [i for i in infos if i["esp"] and self._is_app_port(i)]
+        if app:
+            try:
+                self.refresh_ports(force=True)
+            except Exception:
+                pass
+            if self.cbo_port.get().strip() != app[0]["dev"]:
+                self._set_port(app[0]["dev"])
+            self.toggle_conn()
+            return
+        if tries < 24:                      # 12 秒
+            if tries == 0:
+                self._flash_print("[连接] 等芯片从下载模式切回固件…\n")
+            self.after(500, lambda: self._after_flash_reconnect(tries + 1))
+            return
         try:
             self.refresh_ports(force=True)
         except Exception:
             pass
-        self.toggle_conn()
+        boot = [i for i in infos if i["esp"]]
+        if boot:
+            self._flash_print(
+                "[提示] 等了 12 秒，板子还停在下载模式（%s）。\n"
+                "  请拔插一次 USB（或按一下 EN），再点「扫端口」就能连上。\n"
+                % boot[0]["dev"])
+        else:
+            self._flash_print(
+                "[提示] 没扫到 ESP32。拔插一次 USB 后点「扫端口」。\n")
 
     def _build(self, fix_size=False):
         # 已废弃：UI 改为左侧栏 + 四页（_build_shell / _build_pages / _show_page）。
@@ -3829,6 +4007,10 @@ class App(tk.Tk):
             self._hint("没扫到串口，检查 USB 是直连还是仅供电")
             return []
         esp = [i for i in infos if i["esp"]]
+        # 同一个复合 USB 设备可能同时挂着「运行态 CDC（.1）」和「下载模式
+        # USB-Serial/JTAG（.0）」两个口，后者连上也没用（固件没在跑），
+        # 所以挑口时优先 .1。
+        app = [i for i in esp if self._is_app_port(i)]
         pref = read_port_pref()
         cur = self.cbo_port.get().strip()
         pick, why = None, ""
@@ -3843,13 +4025,15 @@ class App(tk.Tk):
                 if i["ser"] and i["ser"] == pref["ser"]:
                     pick, why, ser_hit = i["dev"], "序列号记忆", True
                     break
-        if pick is None and len(esp) == 1:                     # ③
-            pick, why = esp[0]["dev"], "唯一乐鑫口"
+        if pick is None and len(app) == 1:                     # ③
+            pick, why = app[0]["dev"], "唯一乐鑫口"
+        if pick is None and not app and len(esp) == 1:
+            pick, why = esp[0]["dev"], "乐鑫口（还在下载模式）"
         if pick is None:                                       # ④ / ⑤
             if pref.get("port") in devices:
                 pick, why = pref["port"], "上次用过的口"
-            elif esp:
-                pick, why = esp[-1]["dev"], "多个乐鑫口，后台确认中"
+            elif app or esp:
+                pick, why = (app or esp)[-1]["dev"], "多个乐鑫口，后台确认中"
             else:
                 pick, why = devices[-1], "端口号最大"
 
@@ -4122,6 +4306,16 @@ def write_diag():
     lines.append("cwd         : %s" % os.getcwd())
     lines.append("")
     lines.append("pyserial    : %s" % ("OK" if serial is not None else "MISSING"))
+    # 刷固件要用 esptool：外部装了优先用外部，没装就用包里内嵌的
+    try:
+        import esptool as _esp
+        lines.append("esptool     : 内嵌 %s" % getattr(_esp, "__version__", "?"))
+    except Exception as exc:
+        lines.append("esptool     : 内嵌不可用 - %s" % exc)
+    _ext = None
+    for _n in ("esptool", "esptool.exe"):
+        _ext = _ext or shutil.which(_n)
+    lines.append("esptool ext : %s" % (_ext or "未安装（将用内嵌）"))
     lines.append("bg.png      : %s" % (App._asset("bg.png") or "MISSING"))
     lines.append("ini         : %s" % ini_path())
     lines.append("")
@@ -4165,7 +4359,64 @@ def write_diag():
     return dst
 
 
+def write_esptool_selftest(port):
+    """--selftest-esptool COMx：用**内嵌** esptool 读一次芯片型号，写进文本。
+
+    目标机刷不了固件时，让用户跑这个，把结果发回来就能分清是「esptool 环境
+    问题」还是「端口/硬件问题」。也用于发版前验证内嵌那份确实能跑。
+    """
+    out = ["CMCC_RC_Keys esptool 自检（进程内）", "=" * 40,
+           "port        : %s" % port,
+           "frozen      : %s" % bool(getattr(sys, "frozen", False)),
+           "_MEIPASS    : %s" % getattr(sys, "_MEIPASS", "-"), ""]
+
+    class _UI:
+        def put(self, fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    class _Stub:
+        def _flash_print(self, s):
+            out.append(s.rstrip("\n"))
+
+        def _flash_insert(self, s, tag=None):
+            out.append(s.rstrip("\n"))
+
+    stub = _Stub()
+    t0 = time.time()
+    try:
+        rc, txt = App._exec_esptool_inproc(stub, ["--port", port, "chip-id"], _UI(), 90.0)
+        out.append("")
+        out.append("rc          : %r" % rc)
+        out.append("耗时        : %.1f s" % (time.time() - t0))
+        out.append("芯片型号    : %r" % App._parse_chip(txt))
+        out.append("失败原因    : %r" % App._esptool_fail_reason(txt))
+    except Exception as exc:
+        out.append("EXCEPTION   : %s: %s" % (type(exc).__name__, exc))
+    text = "\n".join(out)
+    dst = os.path.join(app_dir(), "esptool_selftest.txt")
+    try:
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        dst = os.path.join(os.environ.get("TEMP", "."), "esptool_selftest.txt")
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    return dst
+
+
 def main():
+    if "--selftest-esptool" in sys.argv:
+        i = sys.argv.index("--selftest-esptool")
+        port = sys.argv[i + 1] if len(sys.argv) > i + 1 else ""
+        p = write_esptool_selftest(port)
+        try:
+            messagebox.showinfo("自检完成", "esptool 自检结果已写入：\n%s" % p)
+        except Exception:
+            pass
+        return
     if "--diag" in sys.argv:
         p = write_diag()
         try:

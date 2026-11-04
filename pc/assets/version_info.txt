@@ -2,8 +2,8 @@
 # 版本号要与 remote_ui.py 里的 APP_VER 保持一致
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 3, 0, 0),
-    prodvers=(1, 3, 0, 0),
+    filevers=(1, 3, 1, 0),
+    prodvers=(1, 3, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         u'080404B0',
         [StringStruct(u'CompanyName', u'lozet'),
          StringStruct(u'FileDescription', u'CMCC 语音遥控器 - 按键映射'),
-         StringStruct(u'FileVersion', u'1.3.0'),
+         StringStruct(u'FileVersion', u'1.3.1'),
          StringStruct(u'InternalName', u'CMCC_RC_Keys'),
          StringStruct(u'OriginalFilename', u'CMCC_RC_Keys.exe'),
          StringStruct(u'ProductName', u'CMCC 遥控器按键映射工具'),
-         StringStruct(u'ProductVersion', u'1.3.0')])
+         StringStruct(u'ProductVersion', u'1.3.1')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
   ]

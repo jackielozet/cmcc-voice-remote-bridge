@@ -49,6 +49,20 @@ try:
 except Exception:
     pass
 
+# 内嵌 esptool：目标机没装 Python / esptool 时也能刷固件。
+# 1.3.0 曾用 [sys.executable, "-m", "esptool"] 兜底，单文件 exe 下等于再开一个
+# 上位机（sys.executable 就是它自己），刷不了也没法退出。
+# 注意：esptool 是 GPL-2.0，内嵌后整个 exe 按 GPL-2.0 分发，见 docs/third-party.md。
+for _mod in ('esptool', 'esp_pylib', 'rich', 'rich_click', 'click',
+             'reedsolo', 'intelhex', 'cryptography'):
+    try:
+        _d, _b, _h = collect_all(_mod)
+        datas += _d
+        binaries += _b
+        hiddenimports += _h
+    except Exception as exc:
+        print('!! collect_all(%s) 失败：%s' % (_mod, exc))
+
 hiddenimports += ['serial', 'serial.tools', 'serial.tools.list_ports',
                   'numpy', 'asr_win',
                   'PIL', 'PIL.Image', 'PIL.ImageTk']
