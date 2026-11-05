@@ -110,12 +110,13 @@ init_metrics()
 SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
 
-APP_VER = "1.3.2"
+APP_VER = "1.3.3"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
 
 # 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
 # 加版本时只往这里加一行，界面不用改。
 APP_VER_LOG = [
+    "20261105：v1.3.3-刷完即用（固件内置完整键位）",
     "20261105：v1.3.2-刷完固件自动恢复按键映射",
     "20261104：v1.3.1-修复换机后刷不了固件",
     "20261104：v1.3.0-重构UI",
@@ -620,10 +621,10 @@ REV_SHORT = {v: k for k, v in SHORT.items()}
 
 # 首次生成 ini 用的默认动作（与设备出厂默认一致，对应固件 migv=4）
 DEFAULT_ACTIONS = {
-    "电源": "Win+L", "TV": "", "设置": "Win+I", "静音": "静音",
+    "电源": "Win+L", "TV": "", "设置": "Ctrl+C", "静音": "静音",
     "上": "↑", "左": "←", "确定": "回车", "右": "→", "下": "↓",
-    "菜单": "菜单键", "返回": "Esc", "麦克风": "Win+H",
-    "音量+": "音量 +", "音量-": "音量 -", "主页": "Win", "M": "Ctrl+Z",
+    "菜单": "Win", "返回": "Esc", "麦克风": "Win+H",
+    "音量+": "音量 +", "音量-": "音量 -", "主页": "Win", "M": "Ctrl+V",
     "频道+": "PageDown", "频道-": "PageUp",
     "1": "1", "2": "2", "3": "3", "4": "4", "5": "5",
     "6": "6", "7": "7", "8": "8", "9": "9", "0": "0",
@@ -815,7 +816,16 @@ def write_ini(path, items):
 
 
 def default_items():
-    """内置默认：按遥控器界面顺序"""
+    """内置默认映射，按遥控器界面顺序返回 (键名, out_type, keys, n)。
+
+    **必须与固件 DEFAULTS[]（cmcc_s3_bridge_v4voice_*.ino）逐条一致。**
+    两处是两条独立的兜底路径：
+      · 固件里那份 —— 整片刷 merged.bin 清空 NVS 后，setup() 直接落它，
+        不连电脑、没有 ini 也已经可用；
+      · 这里这份 —— 上位机发现本地没有 remotekey.ini 时用它下发。
+    任一处改了另一处没跟上，「刷完即用」就会出现两套结果。
+    改完可用 pc/test_default_sync.py 校验一致性。
+    """
     out = []
     for label, kid, _, _ in REMOTE:
         r = parse_action(DEFAULT_ACTIONS.get(label, ""))
@@ -3648,10 +3658,18 @@ class App(tk.Tk):
             self._flash_print("[映射] 没连上设备，跳过自动写回。\n")
             return
 
+        # ini 优先；本地没有 ini（或一条都没解析出来）时用内置默认表兜底。
+        # 内置表与固件 DEFAULTS 是同一套键位，所以两条路殊途同归：
+        # 有 ini 就恢复你调好的，没 ini 就落回出厂默认，都不会出现「空表推下去」。
+        table, source = self.ini, INI_NAME
+        if not table:
+            table = {n: (ot, k, c) for n, ot, k, c in default_items()}
+            source = "内置默认表"
+
         items = []
         pushed = 0
         for label, kid, _, _ in REMOTE:
-            r = self.ini.get(label)
+            r = table.get(label)
             if r is None:
                 continue
             ot, keys, n = r
@@ -3667,11 +3685,11 @@ class App(tk.Tk):
 
         if not items:
             self._flash_print(
-                "[映射] 本地没有 remotekey.ini，设备停在出厂默认映射。\n"
-                "  调好键位后点一次「保存到设备」，以后刷固件就会自动恢复。\n")
+                "[映射] 既没有 %s、内置默认表也是空的，跳过写回。\n" % INI_NAME)
             return
 
-        self._flash_print("[映射] 正在把 %d 条映射写回设备…\n" % pushed)
+        self._flash_print(
+            "[映射] 正在把 %d 条映射写回设备（来源：%s）…\n" % (pushed, source))
 
         def do_save():
             self.send("SAVE")

@@ -78,8 +78,21 @@ ini = {
 }
 case("3 条映射，含 n=0 和 TV", ini)
 
-# 2) 空 ini：不应该发任何东西
-case("ini 为空", {})
+# 2) 空 ini：改走内置默认表兜底（以前是直接跳过、只打一行提示，
+#    结果设备停在固件那 28 条残缺默认表上，5 个键没反应）
+print("\n" + "=" * 60)
+print("用例：ini 为空 -> 内置默认表兜底")
+p = Probe({})
+p._push_after_flash_run()
+sets = [c for c in p.sent if c.startswith("SET")]
+print("SET 条数：%d（应为 29，TV 是红外键不下发）" % len(sets))
+print("含确定 2041：", any(c.startswith("SET 2041") for c in p.sent))
+print("含菜单 1065：", any(c.startswith("SET 1065") for c in p.sent))
+print("含主页 2223：", any(c.startswith("SET 2223") for c in p.sent))
+print("含返回 2224：", any(c.startswith("SET 2224") for c in p.sent))
+print("含 * 1055：  ", any(c.startswith("SET 1055") for c in p.sent))
+print("SAVE 是最后一条：", bool(p.sent) and p.sent[-1] == "SAVE")
+print("标志已复位：", p._push_after_flash is False)
 
 # 3) 未连接：直接跳过
 case("未连接", ini, connected=False)
