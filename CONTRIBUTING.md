@@ -51,4 +51,4 @@ python pc/test_shield3.py
 - 改了界面坐标就顺手跑 `python pc/check_layout.py`（引线端点是否还落在键上）；
 - 改了固件协议就同步更新 `docs/protocol.md`，**命令表以文档为准**。
 
-提交即表示同意以本项目 [MIT 许可证](LICENSE) 授权。
+提交即表示同意以本项目 [GPL-2.0 许可证](LICENSE) 授权。

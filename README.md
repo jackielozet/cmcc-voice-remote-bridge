@@ -437,8 +437,17 @@ G.722.1 的 Polycom 专利，商用前请务必先看。
 
 ## 许可
 
-本项目代码以 [MIT](LICENSE) 发布。随发布物分发的第三方组件沿用各自许可证，
-其中 `decode.exe`（GPL-2.0）与识别模型权重的条款见 [`docs/third-party.md`](docs/third-party.md)。
+本项目代码以 **[GPL-2.0](LICENSE)** 发布（全文见 [`LICENSE`](LICENSE)）。
+
+> **版本分界**：1.3.2 及以后为 GPL-2.0；**1.3.1 及更早的版本按 MIT 发布**，已下载的旧版
+> 继续适用当时的 MIT 条款。之所以改，是因为 esptool（GPL-2.0）自 1.3.1 起被内嵌进
+> `CMCC_RC_Keys.exe`，打包分发后整个可执行文件都在 GPL 的约束下，继续标 MIT 会自相矛盾。
+
+这意味着你可以自由使用、修改、再分发，但**再分发时必须同样以 GPL-2.0 开放源代码**，
+并保留版权声明与免责条款。商业闭源集成请自行评估合规性。
+
+随发布物分发的第三方组件沿用各自许可证，其中 `decode.exe`（GPL-2.0）、
+`esptool`（GPL-2.0）与识别模型权重的条款见 [`docs/third-party.md`](docs/third-party.md)。
 
 改硬件有风险（供电、静电、刷坏固件），一切后果自负；
 本项目和遥控器厂商、运营商无关。
@@ -493,5 +502,5 @@ notably `decode.exe` under GPL-2.0 and the Polycom patents covering G.722.1 — 
 [`docs/third-party.md`](docs/third-party.md).
 
 Build: see [`docs/build.md`](docs/build.md). Firmware targets Arduino-ESP32 3.3.12,
-FQBN `esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc`. License: MIT (third-party components
-keep their own licenses).
+FQBN `esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc`. License: GPL-2.0 from 1.3.2 onward
+(1.3.1 and earlier were MIT); third-party components keep their own licenses.

@@ -110,12 +110,13 @@ init_metrics()
 SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
 
-APP_VER = "1.3.1"
+APP_VER = "1.3.2"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
 
 # 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
 # 加版本时只往这里加一行，界面不用改。
 APP_VER_LOG = [
+    "20261105：v1.3.2-刷完固件自动恢复按键映射",
     "20261104：v1.3.1-修复换机后刷不了固件",
     "20261104：v1.3.0-重构UI",
 ]
@@ -1364,6 +1365,7 @@ class App(tk.Tk):
         self._cap = []              # 硬件信息页抓取时的临时缓冲
         self._cap_active = False
         self._flash_running = False
+        self._push_after_flash = False   # 刷写成功后是否要自动把映射写回设备
         self.asr_engine = None      # asr_win.AsrEngine
         self.asr_hook = None        # 吞掉语音键组合的钩子
         self.asr_framer = None
@@ -3552,6 +3554,10 @@ class App(tk.Tk):
         ui.put(lambda: self._flash_print(
             "--- 刷写进程结束，返回码 %s ---\n" % rc))
         if rc == 0:
+            # 刷 merged.bin 从 0x0 写会把 NVS 清成 0xFF，设备回默认映射，
+            # 而界面显示的是 remotekey.ini —— 两边不一致，用户按的键就不是他调好的。
+            # 连回去之后自动把 ini 写回设备，见 _push_after_flash_run。
+            self._push_after_flash = True
             ui.put(lambda: self._flash_print("=== 刷写成功 ===\n"))
         else:
             why = self._flash_fail_reason(txt)
@@ -3591,6 +3597,9 @@ class App(tk.Tk):
             if self.cbo_port.get().strip() != app[0]["dev"]:
                 self._set_port(app[0]["dev"])
             self.toggle_conn()
+            if self._push_after_flash:
+                # 连接时会先发 INFO / LIST，等它们走完再推映射，别抢串口
+                self.after(1600, self._push_after_flash_run)
             return
         if tries < 24:                      # 12 秒
             if tries == 0:
@@ -3602,6 +3611,11 @@ class App(tk.Tk):
         except Exception:
             pass
         boot = [i for i in infos if i["esp"]]
+        if self._push_after_flash:
+            # 重连都没成功，就别挂着这个标志了，如实告诉用户要手工补一次
+            self._push_after_flash = False
+            self._flash_print(
+                "[映射] 这次没能自动写回（还没连上），连上后点一次「保存到设备」。\n")
         if boot:
             self._flash_print(
                 "[提示] 等了 12 秒，板子还停在下载模式（%s）。\n"
@@ -3610,6 +3624,66 @@ class App(tk.Tk):
         else:
             self._flash_print(
                 "[提示] 没扫到 ESP32。拔插一次 USB 后点「扫端口」。\n")
+
+    def _push_after_flash_run(self, tries=0):
+        """刷写成功后，把 remotekey.ini 里整套映射写回设备并写闪存。
+
+        刷 merged.bin 是从 0x0 整片写的，NVS 区被清成 0xFF，固件起来是出厂
+        默认映射；而上位机界面显示的是本地 ini。两边一对不上，用户按遥控器
+        就不是他调好的键位，得手动进「按键映射」页点一次「保存到设备」才恢复。
+        这里刷完自动做掉。
+
+        只由刷写成功（返回码 0）触发；检测芯片不碰。
+        """
+        if not self._push_after_flash:
+            return
+        # 连上之后 _hw_refresh 会连发 STAT/TARGET/INFO/REPORTS/MAPDUMP/BATT/SCANDUMP，
+        # 每条间隔 1 秒、总共 7 秒。这期间往里插 SET 会把抓取缓冲搅乱，
+        # 也可能让 MAPDUMP 的长输出和 OK SET 混在一起，所以等它抓完再推。
+        if self._cap_active and tries < 40:          # 最多再等 20 秒
+            self.after(500, lambda: self._push_after_flash_run(tries + 1))
+            return
+        self._push_after_flash = False
+        if self.ser is None:
+            self._flash_print("[映射] 没连上设备，跳过自动写回。\n")
+            return
+
+        items = []
+        pushed = 0
+        for label, kid, _, _ in REMOTE:
+            r = self.ini.get(label)
+            if r is None:
+                continue
+            ot, keys, n = r
+            items.append((label, ot, keys, n))
+            if not kid:              # TV 是红外键，只记 ini，不下发
+                continue
+            pushed += 1
+            if n == 0:
+                self.send("SET %04X 1 0" % kid)
+            else:
+                arg = " ".join("%02X" % keys[i] for i in range(n))
+                self.send("SET %04X %d %d %s" % (kid, ot, n, arg))
+
+        if not items:
+            self._flash_print(
+                "[映射] 本地没有 remotekey.ini，设备停在出厂默认映射。\n"
+                "  调好键位后点一次「保存到设备」，以后刷固件就会自动恢复。\n")
+            return
+
+        self._flash_print("[映射] 正在把 %d 条映射写回设备…\n" % pushed)
+
+        def do_save():
+            self.send("SAVE")
+            self.changed.clear()
+            self._refresh_all()
+            self._mark_dirty()
+            self.lbl_status.configure(
+                text="已恢复 %d 条映射" % pushed, fg=ACCENT)
+            self._flash_print(
+                "[映射] 已写回并保存 %d 条，按键立即生效\n" % pushed)
+
+        self.after(400, do_save)     # 等上面那串 SET 走完再发 SAVE
 
     def _build(self, fix_size=False):
         # 已废弃：UI 改为左侧栏 + 四页（_build_shell / _build_pages / _show_page）。
