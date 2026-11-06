@@ -97,7 +97,8 @@ ESP32 通过一根 USB 线同时暴露三个身份：
 
 | 目录 | 说明 |
 |---|---|
-| `firmware/cmcc_s3_bridge_v4voice_20261105_1300/` | **推荐**。1.3.3 的 Release 附件就是这一版：出厂默认映射补齐到 33 条（缺 确定/菜单/返回/主页/`*` 的毛病已修），整片刷完不用点「保存到设备」按键就能用 |
+| `firmware/cmcc_s3_bridge_v4voice_20261106_1900/` | **推荐**。1.3.4 的 Release 附件就是这一版：加了语音开麦指令（部分遥控器不发 `0xFB` 写就不推流），默认映射仍是 33 条 |
+| `firmware/cmcc_s3_bridge_v4voice_20261105_1300/` | 1.3.3 的版本：出厂默认映射补齐到 33 条（缺 确定/菜单/返回/主页/`*` 的毛病已修）。**没有开麦指令**，遇到按键正常但语音没反应就换上面那版 |
 | `firmware/cmcc_s3_bridge_v4voice_20261103_2324/` | 1.3.0 的版本：固件自报构建名（`OK INFO name=`），但默认映射只有 28 条 |
 | `firmware/cmcc_s3_bridge_v4voice_20261031_2226/` | 语音通道首发版，功能与上一版一致，只是不上报构建名 |
 | `firmware/cmcc_s3_bridge_v3auto_20261029_0051/` | 只有按键，不订阅语音通道。不用语音功能就用它 |
@@ -159,7 +160,7 @@ static const char *TARGET_ADDR = "0c:f3:cc:63:10:e3";   // 改成你自己遥控
 **A. 直接用发布包**（不需要装 Python、不用配环境）
 
 到 [Releases](https://github.com/jackielozet/cmcc-voice-remote-bridge/releases) 下载
-`CMCC_RC_Keys_1.3.3.exe`（单文件，约 120 MB），放到**有写权限**的目录
+`CMCC_RC_Keys_1.3.4.exe`（单文件，约 120 MB），放到**有写权限**的目录
 （别放 `C:\Program Files`），双击即用。识别模型、解码器、esptool 都收在这一个 exe 里，
 Win10 / Win11 64 位开箱可用。单文件首次启动要解压到 `%TEMP%`，冷启动约 3–5 秒。
 

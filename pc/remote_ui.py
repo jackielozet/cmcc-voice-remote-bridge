@@ -110,12 +110,13 @@ init_metrics()
 SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
 
-APP_VER = "1.3.3"
+APP_VER = "1.3.4"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
 
 # 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
 # 加版本时只往这里加一行，界面不用改。
 APP_VER_LOG = [
+    "20261106：v1.3.4-语音开麦指令 + 修复装了 esptool 的机器刷不了固件",
     "20261105：v1.3.3-刷完即用（固件内置完整键位）",
     "20261105：v1.3.2-刷完固件自动恢复按键映射",
     "20261104：v1.3.1-修复换机后刷不了固件",
@@ -3181,14 +3182,21 @@ class App(tk.Tk):
         except Exception:
             return "内嵌 esptool"
 
-    def _esptool_cmd(self, et, chip, port, baud, fw, before=None):
-        """拼刷写参数。before 一般留空走 esptool 默认复位。
+    def _esptool_cmd(self, chip, port, baud, fw, before=None):
+        """拼刷写参数 —— **返回的 argv 不含程序名**，程序前缀由 `_run_esptool` 统一加。
+
+        1.3.3 的坑（2026-11-06 实测暴露）：这里原本是 `list(et) + [...]`，
+        而 `_run_esptool` 里又 `list(et) + list(argv)` 拼了一次，于是装了外部 esptool
+        的机器上实际执行的是 `esptool.EXE esptool.EXE --chip ...`，esptool 把第一个
+        参数当成子命令，直接报 `No such command ...`、返回码 2。
+        没装外部 esptool 的机器 `et` 为空，两处都拼不出东西 → 一直正常，
+        这就是它为什么拖到 1.3.3 才暴露（1.3.1/1.3.3 的实测机都没装外部 esptool）。
 
         1.3.0 曾对「已进下载模式」的芯片强制 `--before no_reset`，实测反而是错的：
         这块板进下载模式后是 USB-Serial/JTAG 口，esptool 自己的 `USBJTAGSerialReset`
         是有效的（0.6 秒连上），而 no_reset 跳过握手直接发命令 → `Write timeout`。
         """
-        cmd = list(et) + ["--chip", chip, "--port", port, "--baud", baud]
+        cmd = ["--chip", chip, "--port", port, "--baud", baud]
         if before:
             cmd += ["--before", before]
         return cmd + ["write_flash", "0x0", fw]
@@ -3400,10 +3408,12 @@ class App(tk.Tk):
     def _run_esptool(self, argv, et, ui, timeout=900.0):
         """跑 esptool 的统一入口：有外部程序用外部，没有就用包里内嵌的那份。
 
-        `argv` 不含程序名。两条路返回同样的 `(返回码, 全部输出)`。
+        `argv` **不含程序名**（程序前缀在这里加），两条路返回同样的 `(返回码, 全部输出)`。
         """
-        ui.put(lambda a=argv: self._flash_print(
-            ">>> esptool " + " ".join(a) + "\n"))
+        # 日志里把真正用的那个程序打出来：排障时一眼能看出走的是外部还是内嵌，
+        # 1.3.3 那次「No such command」就是靠这行路径认出来的。
+        ui.put(lambda a=argv, e=et: self._flash_print(
+            ">>> " + (e[0] if e else "esptool(内嵌)") + " " + " ".join(a) + "\n"))
         if et:
             return self._exec_esptool(list(et) + list(argv), ui,
                                       getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -3542,7 +3552,7 @@ class App(tk.Tk):
                 "[刷写] 软复位没成功，仍用 %s 试一次 esptool 自带复位\n" % p))
         # 进下载模式后是 USB-Serial/JTAG 口，esptool 自己的 USBJTAGSerialReset
         # 有效（实测 0.6 秒连上）；反而 `--before no_reset` 会跳过握手 → Write timeout。
-        argv = self._esptool_cmd(et, chip, port, baud, fw)
+        argv = self._esptool_cmd(chip, port, baud, fw)
         rc, txt = self._run_esptool(argv, et, ui, 900.0)
 
         # 兜底重试：软复位成功、esptool 却仍连不上——多半是端口刚枚举出来
@@ -3557,7 +3567,7 @@ class App(tk.Tk):
             again = self._soft_enter_boot(port, ui)
             port = again or port
             ui.put(lambda p=port: self._set_port(p))
-            argv = self._esptool_cmd(et, chip, port, baud, fw)
+            argv = self._esptool_cmd(chip, port, baud, fw)
             rc, txt = self._run_esptool(argv, et, ui, 900.0)
 
         self._flash_running = False
