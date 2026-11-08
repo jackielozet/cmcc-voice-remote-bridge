@@ -108,8 +108,11 @@ def main():
         return 2
     show("复位后")
 
-    print("[3] 用 --before no_reset 连接 %s 验证" % new)
-    esptool(new, "--before", "no_reset", "chip-id")
+    # 必须加 --after no-reset：否则 chip-id 做完 esptool 会自动 hard reset，
+    # 芯片重启退出下载模式、端口号变回去，紧接着的 write_flash 就报
+    # "Could not open COMx, the port is busy"。实测踩过一次。
+    print("[3] 用 --before no_reset --after no_reset 连接 %s 验证" % new)
+    esptool(new, "--before", "no_reset", "--after", "no_reset", "chip-id")
     if not fw:
         print("\n>>> 已可连接。刷写命令（先关掉上位机）：")
         print('    esptool --chip esp32s3 --port %s --baud 921600 --before no_reset '

@@ -29,6 +29,7 @@ import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import messagebox
 from tkinter import filedialog
+from tkinter import ttk
 
 try:
     import winreg
@@ -110,12 +111,13 @@ init_metrics()
 SIDEBAR_W = zp(140)      # 左侧导航栏宽度（固定，不随窗口等比缩放）
 
 
-APP_VER = "1.3.4"
+APP_VER = "1.3.5"
 APP_TITLE = "CMCC 遥控器 - 按键映射  v%s" % APP_VER
 
 # 鼠标停到左下角版本号上时弹出的更新内容（新的写在最前面，一行一条）。
 # 加版本时只往这里加一行，界面不用改。
 APP_VER_LOG = [
+    "20261109：v1.3.5-Fn 多媒体组合键可绑定（静音/音量/播放等）",
     "20261106：v1.3.4-语音开麦指令 + 修复装了 esptool 的机器刷不了固件",
     "20261105：v1.3.3-刷完即用（固件内置完整键位）",
     "20261105：v1.3.2-刷完固件自动恢复按键映射",
@@ -323,6 +325,32 @@ VK_MOD = {
     0xA2: MOD_CTRL, 0xA3: MOD_CTRL, 0x11: MOD_CTRL,
     0xA4: MOD_ALT, 0xA5: MOD_ALT, 0x12: MOD_ALT,
     0x5B: MOD_WIN, 0x5C: MOD_WIN,
+}
+
+# ------------------------------------------------------ 多媒体键（Fn 组合）--
+# Fn+F1 静音、Fn+F2/F3 音量、Fn+F5 播放暂停这类组合，**在硬件/驱动层就已经被译成
+# "消费者控制"键**，Windows 交给程序的是一个专门的 VK（0xAD / 0xAE / 0xAF …），
+# 根本不会产生可用的键盘按键消息。所以它们既不在 VK_USAGE 里、也塞不进键盘报告，
+# 必须单独映射成 HID Consumer 页面的 usage，走 outType=2（消费者输出）这条路。
+#
+# 以前漏了这张表 → 录键对话框收到 VK 但查不到 usage，直接 return，
+# 用户看到的就是"按了没反应、绑不上"。这是本次修的根因。
+#
+# 只列 MEDIA_NAME 里已经有名字的 usage，认不出的不猜。
+VK_MEDIA = {
+    0xAD: 0x00E2,   # VK_VOLUME_MUTE        -> 静音
+    0xAE: 0x00EA,   # VK_VOLUME_DOWN        -> 音量 -
+    0xAF: 0x00E9,   # VK_VOLUME_UP          -> 音量 +
+    0xB0: 0x00B5,   # VK_MEDIA_NEXT_TRACK   -> 下一曲
+    0xB1: 0x00B6,   # VK_MEDIA_PREV_TRACK   -> 上一曲
+    0xB2: 0x00B7,   # VK_MEDIA_STOP         -> 停止
+    0xB3: 0x00CD,   # VK_MEDIA_PLAY_PAUSE   -> 播放/暂停
+    0xA6: 0x0224,   # VK_BROWSER_BACK       -> 浏览器后退
+    0xA7: 0x0225,   # VK_BROWSER_FORWARD    -> 浏览器前进
+    0xAC: 0x0223,   # VK_BROWSER_HOME       -> 浏览器主页
+    0xAA: 0x0221,   # VK_BROWSER_SEARCH     -> 搜索
+    0xB5: 0x0183,   # VK_LAUNCH_MEDIA_SELECT-> 媒体播放器
+    0xB6: 0x0192,   # VK_LAUNCH_APP1        -> 计算器
 }
 
 
@@ -644,6 +672,77 @@ def ini_path():
     return os.path.join(app_dir(), INI_NAME)
 
 
+# --------------------------------------------------- 遥控器键位方案（多套）--
+# 为什么另一个文件：remotekey.ini 是「键名 = 动作」，要用记事本手改；
+# 而「卡片对应哪个 usage」是硬件事实，只有程序自己会写，混进 ini 会把它搞乱。
+#
+# 里面的 kids 是「卡片名 -> 设备 id」：
+#   电源 -> 1066   (键盘 0x66)
+#   设置 -> 20EB   (Consumer 0x0EB)
+# 默认值取自 REMOTE，学习遥控器按键后改写的就是这一项。
+# 不同遥控器的 usage 并不一样（一号的麦克风是键盘 0x3E，三号走 0xF8 控制帧），
+# 所以按遥控器分「方案」，页面下方下拉切换。
+BIND_NAME = "remotebind.json"
+
+
+def bind_path():
+    return os.path.join(app_dir(), BIND_NAME)
+
+
+def default_kidmap():
+    """REMOTE 里写死的那套 id —— 一号遥控的布局，也是出厂默认。"""
+    return {label: kid for label, kid, _x, _y in REMOTE if kid}
+
+
+def load_bindfile():
+    """返回 (profiles, current)。缺失/损坏一律退回「方案一 = 出厂默认」。"""
+    base = default_kidmap()
+    fallback = ({"方案一": {"kids": dict(base), "note": ""}}, "方案一")
+    path = bind_path()
+    if not os.path.exists(path):
+        return fallback
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return fallback
+    if not isinstance(raw, dict):
+        return fallback
+
+    known = {label for label, _k, _x, _y in REMOTE}
+    profs = {}
+    for name, v in (raw.get("profiles") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        kids = dict(base)                    # 缺的项按默认补，避免老文件缺字段
+        for label, kid in (v.get("kids") or {}).items():
+            if label not in known:           # 版本升级后残留的名字，丢掉
+                continue
+            try:
+                kids[label] = int(kid)
+            except (TypeError, ValueError):
+                pass
+        profs[str(name)] = {"kids": kids, "note": str(v.get("note") or "")}
+    if not profs:
+        return fallback
+    cur = str(raw.get("current") or "")
+    if cur not in profs:
+        cur = sorted(profs)[0]
+    return profs, cur
+
+
+def save_bindfile(profiles, current):
+    """写方案文件。失败静默 —— 它只是辅助数据，不能因为写不进去就崩。"""
+    try:
+        with open(bind_path(), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "current": current, "profiles": profiles},
+                      fh, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+
 # ------------------------------------------------- 串口身份记忆（分级判定用）--
 # 为什么单独一个文件：remotekey.ini 是「键名 = 动作」的行式映射表，
 # 往里塞串口会把手改过的映射表搞乱，所以另存一份小的 json。
@@ -867,7 +966,6 @@ HW_TIPS = {
     "mapd": "Report Map 原文（224 字节）以及从中解析出的报告结构。\n它只说明「有哪些报告、各多少字节」，不含任何音频编码参数。",
 }
 
-
 class HoverTip:
     """轻量悬浮提示：鼠标停留 350ms 弹出，单击立刻弹出（3 秒后自动收起）。
 
@@ -1055,6 +1153,19 @@ class Recorder(tk.Toplevel):
         self.after(40, self._center)
         self.after(80, lambda: self.focus_force())
 
+        # 录键期间让固件「只上报、不输出」。
+        # 否则你按一下遥控器，桥就会真的发一次那个键：对话框会把它当成
+        # "用户按的键"录进去，想绑 Ctrl+V 结果录到了遥控器上那个键。
+        # 复用 LEARN 1（固件里同一个开关：进 learning 就不 pressBind），
+        # 不用为这个功能单独改固件。
+        self._muted = False
+        try:
+            if getattr(master, "ser", None) is not None:
+                master.send("LEARN 1")
+                self._muted = True
+        except Exception:
+            self._muted = False
+
     def _set_shield_label(self):
         if self._lock_on:
             self.lbl_shield.configure(
@@ -1154,8 +1265,15 @@ class Recorder(tk.Toplevel):
             self.mods.add(mod)
             self._show_pending()
             return
+        # 多媒体键（Fn+F1 静音 / Fn+F2 音量- …）：走消费者输出，不进键盘报告。
+        # 必须放在 VK_USAGE 之前，虽然两张表不重叠，但这里语义更清楚。
+        cons = VK_MEDIA.get(vk)
+        if cons is not None:
+            self._commit_media(cons)
+            return
         u = VK_USAGE.get(vk)
         if u is None:
+            self._commit_unknown(vk)
             return
         self._commit(list(self.mods) + [u], "keyboard")
 
@@ -1165,6 +1283,14 @@ class Recorder(tk.Toplevel):
             self._on_mod_release(mod)
 
     def destroy(self):
+        # 关闭录制对话框 = 解除按键屏蔽，否则遥控器会一直「按了没反应」
+        if getattr(self, "_muted", False):
+            self._muted = False
+            try:
+                if getattr(self.master, "ser", None) is not None:
+                    self.master.send("LEARN 0")
+            except Exception:
+                pass
         try:
             if self._shielded:
                 self._shielded = False
@@ -1267,6 +1393,26 @@ class Recorder(tk.Toplevel):
         names = [MOD_LABEL[m] for m in (MOD_CTRL, MOD_SHIFT, MOD_ALT, MOD_WIN) if m in self.mods]
         self.lbl_rec.configure(text="+".join(names + ["…"]) if names else "等待按键…")
 
+    def _commit_media(self, usage):
+        """多媒体键绑定：outType=2，keys[0] | keys[1]<<8 是 16 位消费者 usage。
+
+        编码必须和 parse_action() 里 "音量 +" 这类文本完全一致，否则同一个动作
+        走"按键盘录制"和"手填文本"会得到两份不同的绑定。
+        """
+        self._plain_committed = True
+        self.result = (2, [usage & 0xFF, (usage >> 8) & 0xFF, 0, 0], 2)
+        self.lbl_rec.configure(text=describe(*self.result))
+
+    def _commit_unknown(self, vk):
+        """钩子收到了键，但认不出该给什么输出 —— 必须回显，不能再静默。
+
+        典型是纯 ACPI 键（Fn+亮度 / 飞行模式 / 键盘背光 / 投影切换）：这些键由
+        主控 EC 直接处理，既不产生 HID 键码也没有对应 usage，任何程序都绑不了。
+        以前这里直接 return，用户只看到"按了没反应"，分不清是程序坏了还是键不支持。
+        """
+        self.lbl_rec.configure(
+            text="这个键系统没给可用键码（VK=0x%02X），绑不了" % vk)
+
     def _commit(self, keys, source):
         self._plain_committed = True
         n = min(len(keys), 4)
@@ -1359,10 +1505,21 @@ class App(tk.Tk):
         self.ui_q = queue.Queue()   # 子线程 -> 主线程的 UI 任务队列
         self.bindings = {}          # 设备当前值 id -> dict(out_type, keys, n)
         self.ini = {}               # 配置源 键名 -> (out_type, keys, n)
-        self.changed = set()        # 本次改过的 id
-        self.cards = {}             # id -> dict(rect, text, line,...)
+        self.changed = set()        # 本次改过的**卡片名**（以前存 id，id 可学习了，改用名字更稳）
+        self.cards = {}             # 卡片名 -> dict(rect, text, line,...)
         self.hover = None
         self.ini_note = ""
+
+        # ---- 遥控器键位方案（多套，按遥控分）----
+        # kids：卡片名 -> 设备 id。工厂默认来自 REMOTE，学按键后改写这里。
+        self.profiles, self.cur_profile = load_bindfile()
+        self.kidmap = dict(self.profiles[self.cur_profile]["kids"])
+        # 学习遥控器按键时的临时状态：
+        #   _learn_on      学习模式开着（工具条那个按钮）
+        #   _learn_label   正在等按键的卡片名，None = 还没点卡片
+        self._learn_on = False
+        self._learn_label = None
+        self._learn_timer = None       # 等待按键的超时定时器（15s 提示一次）
 
         # ---- 等比缩放状态 ----
         self._base_wh = None        # 首次构建出的基准尺寸（缩放参照）
@@ -1399,7 +1556,7 @@ class App(tk.Tk):
         self.refresh_ports()
         self._drain()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", self._on_escape)
         # 左侧栏翻页：上/下方向键循环切换（焦点在输入框/文本框时不抢键）
         self.bind("<Up>", lambda e: self._page_step(-1))
         self.bind("<Down>", lambda e: self._page_step(+1))
@@ -1526,6 +1683,9 @@ class App(tk.Tk):
             self.nav_btns = []
             self.cards.clear()
             self.hover = None
+            # 卡片对象全换了，学到一半的状态接不上，直接作废（按钮也会重建）
+            self._learn_label = None
+            self._learn_on = False
 
             self._build_shell()
             self._build_pages()
@@ -1578,6 +1738,14 @@ class App(tk.Tk):
             d["asr"] = bool(self.var_asr.get())
         except Exception:
             pass
+        # 板载灯 GPIO / 灯型：窗口缩放会整页重建，重建后 `_page_hardware`
+        # 会重新给 StringVar 赋默认值（21 / WS2812）—— 用户手填的引脚会丢，
+        # 所以跟串口、波特率一样搬过去。
+        try:
+            d["led_pin"] = self.hw_led_pin.get()
+            d["led_type"] = self.hw_led_type.get()
+        except Exception:
+            pass
         return d
 
     def _restore_ui(self, d):
@@ -1595,6 +1763,14 @@ class App(tk.Tk):
         # 语音勾选：BigCheck 挂的是同一个 var，trace 会自己重画
         try:
             self.var_asr.set(bool(d.get("asr", False)))
+        except Exception:
+            pass
+        # 板载灯：把重建前用户填的 GPIO / 灯型写回新控件
+        try:
+            if d.get("led_pin"):
+                self.hw_led_pin.set(d["led_pin"])
+            if d.get("led_type"):
+                self.hw_led_type.set(d["led_type"])
         except Exception:
             pass
         # 固件烧录页
@@ -1736,7 +1912,7 @@ class App(tk.Tk):
         没连上设备时退回 ini 里的配置。
         返回 (vk, mods, 说明)；vk=0 表示拦不了（比如绑成多媒体键）。
         """
-        dev = self.bindings.get(MIC_KID)
+        dev = self.bindings.get(self.kidmap.get("麦克风", MIC_KID))
         if dev:
             ot, n = dev["out_type"], dev["n"]
             keys = list(dev["keys"])
@@ -1993,8 +2169,8 @@ class App(tk.Tk):
         self._mark_dirty()
 
     def _refresh_all(self):
-        for label, kid, _, _ in REMOTE:
-            self._refresh_card(kid if kid else ("na", label))
+        for label, _kid, _x, _y in REMOTE:
+            self._refresh_card(label)
 
     def _card_value(self, label):
         if label == "TV":
@@ -2031,6 +2207,19 @@ class App(tk.Tk):
         self.lbl_status = tk.Label(top, text="未连接", bg=BG, fg="#c9553f",
                                    font=("Microsoft YaHei UI", zp(9)))
         self.lbl_status.pack(side="left")
+        # 方案（一只遥控一套键位）放顶部、跟着「按键映射」页显隐。
+        # 原来挂在映射页底栏最左，结果底栏四个按钮 + 它挤成一行，
+        # 最右边的「学习遥控器按键」被压到显示不全。
+        self.btn_plan = tk.Menubutton(top, text="", bg=BTN2, fg=BTN2_FG,
+                                      activebackground=CARD_HOVER, activeforeground=TEXT,
+                                      relief="flat", borderwidth=0, anchor="w",
+                                      font=("Microsoft YaHei UI", zp(9)), padx=zp(8),
+                                      pady=zp(2))
+        self.menu_plan = tk.Menu(self.btn_plan, tearoff=0, bg=PANEL, fg=TEXT,
+                                 activebackground=ACCENT, activeforeground="white",
+                                 font=("Microsoft YaHei UI", zp(9)))
+        self.btn_plan.configure(menu=self.menu_plan)
+        self._plan_shown = False
         self.lbl_hint = tk.Label(top, text="", bg=BG, fg=TEXT_DIM,
                                  font=("Microsoft YaHei UI", zp(9)))
         self.lbl_hint.pack(side="right", padx=(0, zp(10)))
@@ -2077,6 +2266,13 @@ class App(tk.Tk):
                 builder()
 
     def _show_page(self, idx):
+        # 离开映射页就退出学习模式。learning 状态下固件只上报、不输出按键，
+        # 用户要是忘了点「结束学习」就切走，遥控器会一直"按了没反应"。
+        if idx != 1:
+            try:
+                self._learn_end(silent=True)
+            except Exception:
+                pass
         for i, f in enumerate(self.pages):
             if f is None:
                 continue
@@ -2088,6 +2284,15 @@ class App(tk.Tk):
             on = (i == idx)
             b.configure(bg=(ACCENT if on else PANEL), fg=("white" if on else TEXT))
         self._cur_page = idx
+        # 方案选择器只属于「按键映射」页
+        bp = getattr(self, "btn_plan", None)
+        if bp is not None:
+            if idx == 1 and not self._plan_shown:
+                bp.pack(side="left", padx=(zp(10), 0), ipadx=zp(2), ipady=zp(2))
+                self._plan_shown = True
+            elif idx != 1 and self._plan_shown:
+                bp.pack_forget()
+                self._plan_shown = False
         # 焦点若还停在被切走那页的输入框/文本框里，这里把焦点收回主窗口。
         # 否则上下键会被那个已隐藏的 Text 吃掉，表现为「点侧栏后方向键没反应」。
         self._drop_input_focus()
@@ -2135,6 +2340,23 @@ class App(tk.Tk):
         return "break"
 
     # --------------------------------------------------- 页1：硬件信息 ----
+    def _combo_open_on_body(self, ev):
+        """只读下拉：点框体文字区也展开列表。
+
+        Windows 的 ttk.Combobox 在 readonly 状态下只有点右侧那个小箭头才
+        展开，点框体文字区只把焦点给它 —— 用户会当成「点不动」。这里补一刀，
+        点在非箭头区时手动 `ttk::combobox::Post` 展开。点箭头区直接返回，
+        交给 Tk 原生处理，避免弹两次。
+        """
+        w = ev.widget
+        try:
+            if ev.x >= w.winfo_width() - zp(22):
+                return None          # 右侧箭头区：Tk 自己会弹
+            w.tk.call("ttk::combobox::Post", w._w)
+        except Exception:
+            pass
+        return None
+
     def _page_hardware(self):
         if self.pages[0] is not None:
             return
@@ -2148,6 +2370,15 @@ class App(tk.Tk):
                   bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
                   activebackground=CARD_HOVER, activeforeground=TEXT,
                   font=("Microsoft YaHei UI", zp(9))).pack(side="right", ipadx=zp(6), ipady=zp(2))
+        # 「重置连接」：删掉程序目录下那三个记忆文件（连接指纹 / 端口记忆 /
+        # 键位映射），让下次启动从零开始 —— 换电脑、换遥控、状态乱掉时用。
+        # 原来这里是「扫描识别遥控」，实测无效（扫不到也连不上，还要依赖固件
+        # 的 SEARCH / SCANDUMP 两个不再维护的命令），该功能连同解析代码已整块删除。
+        tk.Button(head, text="重置连接", command=self._hw_reset_conn,
+                  bg=WARN, fg="#ffffff", relief="flat", borderwidth=0,
+                  activebackground="#96600f", activeforeground="#ffffff",
+                  font=("Microsoft YaHei UI", zp(9))).pack(side="right", ipadx=zp(8),
+                                                          ipady=zp(2), padx=(0, zp(8)))
 
         # 摘要区：每行若干「字段 值 ?」三连，? 悬停或点击给出该字段含义
         self.hw_box = tk.Frame(f, bg=PANEL)
@@ -2155,17 +2386,79 @@ class App(tk.Tk):
         self.hw_grid = tk.Frame(self.hw_box, bg=PANEL)
         self.hw_grid.pack(anchor="w", padx=zp(12), pady=zp(9))
 
-        rawf = tk.Frame(f, bg=BG, padx=zp(18))
-        rawf.pack(fill="both", expand=True, pady=(0, zp(14)))
-        tk.Label(rawf, text="原始指纹（bridge_info.txt）", bg=BG, fg=TEXT_DIM,
-                 font=("Microsoft YaHei UI", zp(9))).pack(anchor="w")
-        self.hw_text = tk.Text(rawf, bg="#0f1c16", fg="#c8f0d8", relief="flat",
-                               font=("Consolas", zp(9)), wrap="word", state="disabled",
-                               height=10)
-        self.hw_text.pack(side="left", fill="both", expand=True)
-        scb = tk.Scrollbar(rawf, command=self.hw_text.yview)
-        scb.pack(side="right", fill="y")
-        self.hw_text.configure(yscrollcommand=scb.set)
+        # ---- 板载灯配置（常驻控件，不随摘要重建）----
+        # 引脚和灯型都写进固件 NVS。不同 ESP32-S3 板子的板载灯 GPIO 没有统一
+        # 标准（实测常见 21 / 38 / 48），还有不少板压根没有 WS2812 彩灯。
+        #
+        # 形态说明（2026-11-08 昊哥定）：GPIO 要的是**一个可编辑的下拉框** ——
+        # 同一个控件既能下拉挑 21 / 48，也能直接把文本改成任意数字，而不是
+        # 「一个输入框 + 旁边一个箭头按钮」。所以这里用 ttk.Combobox：
+        #   GPIO = state normal（可编辑）+ values 21/48
+        #   灯型 = state readonly（只能选，不能乱打）
+        # 早前自绘的 Menubutton 方案已废弃：Tk 的 tk::MbPost 要求 menu 必须是
+        # Menubutton 的子孙控件，否则报 `can't post ...: it isn't a descendant`
+        # 且点了毫无反应 —— 这正是「下拉菜单无法点击」的根因，别再用。
+        self.hw_led_row = tk.Frame(self.hw_grid, bg=PANEL)
+
+        # Combobox 的字体/内边距必须按当前缩放重配（zp() 依赖全局 Z，
+        # 每次重建界面都会变）。下拉列表的字体走 option 数据库。
+        _st = ttk.Style(self)
+        _st.configure("LedPin.TCombobox", font=("Consolas", zp(9)),
+                      padding=(zp(3), zp(6)))
+        _st.configure("LedType.TCombobox", font=("Microsoft YaHei UI", zp(9)),
+                      padding=(zp(4), zp(5)))
+        self.option_add("*TCombobox*Listbox.font", ("Microsoft YaHei UI", zp(9)))
+
+        tk.Label(self.hw_led_row, text="板载灯", bg=PANEL, fg=TEXT_DIM,
+                 anchor="w", font=("Microsoft YaHei UI", zp(9))
+                 ).pack(side="left", padx=(0, zp(8)))
+
+        # GPIO：可编辑下拉（默认 21，下拉可选 48，文本可手打任意数字）
+        self.hw_led_pin = tk.StringVar(value="21")
+        self.cbo_led_pin = ttk.Combobox(
+            self.hw_led_row, textvariable=self.hw_led_pin,
+            values=("21", "48"), width=5, justify="center",
+            style="LedPin.TCombobox", state="normal",
+            font=("Consolas", zp(9)))
+        self.cbo_led_pin.pack(side="left")
+
+        # 灯型：只读下拉（WS2812 彩灯 / 普通单色 LED）
+        self.hw_led_type = tk.StringVar(value="WS2812彩灯")
+        self.cbo_led_type = ttk.Combobox(
+            self.hw_led_row, textvariable=self.hw_led_type,
+            values=("WS2812彩灯", "普通LED"), width=12, justify="left",
+            style="LedType.TCombobox", state="readonly",
+            font=("Microsoft YaHei UI", zp(9)))
+        self.cbo_led_type.pack(side="left", padx=(zp(10), 0))
+
+        # 只读下拉在 Windows 上默认只有点右边小箭头才展开，点框体没反应 ——
+        # 用户会以为坏了，所以点框体文字区也手动展开一次列表。
+        self.cbo_led_type.bind("<Button-1>", self._combo_open_on_body)
+
+        # 测试亮灯用主色（绿底白字 + 加粗），跟「扫描识别遥控」一致才显眼
+        tk.Button(self.hw_led_row, text="测试亮灯", command=self._hw_led_test,
+                  bg=BTN, fg=BTN_FG, relief="flat", borderwidth=0,
+                  activebackground="#0f8b4c", activeforeground="#ffffff",
+                  cursor="hand2",
+                  font=("Microsoft YaHei UI", zp(9), "bold")
+                  ).pack(side="left", padx=(zp(10), 0), ipadx=zp(10), ipady=zp(2))
+
+        self.hw_led_msg = tk.Label(self.hw_led_row, text="", bg=PANEL, fg=TEXT_DIM,
+                                   anchor="w", font=("Microsoft YaHei UI", zp(8)))
+        self.hw_led_msg.pack(side="left", padx=(zp(8), 0))
+
+        # 先挂在固定行上：还没抓过指纹时（只显示提示文字）这一行也要看得见。
+        # 抓到指纹后 `_hw_set_rows` 会把它挪到「电量」正下方。
+        self.hw_led_row.grid(row=1, column=0, columnspan=2, sticky="w",
+                             padx=(0, zp(6)), pady=zp(3))
+
+        # 原来这里有个「原始指纹（bridge_info.txt）」文本框，已删：它显示的是
+        # `_hw_capture` 发的那 7 条命令的串口回包原文，而同一份回包在 `_handle`
+        # 里会被无条件镜像进「固件烧录」页的日志（还带时间戳、且是实时流），
+        # 内容完全重复；并且原始框是按快照拼帧，实测会出现两条回包粘连
+        # （`...RX 锁 2OK TARGET pin=...`），数据质量反而不如页4 日志。
+        # bridge_info.txt 仍然照写不误 —— 它是「上次抓取的指纹」的落盘缓存，
+        # 下次启动时 `_hw_load_file` 靠它把摘要行直接还原出来，不连桥也能看。
         self._hw_load_file()
 
     def _hw_on_show(self):
@@ -2181,17 +2474,19 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._hw_set_message(
-            "尚未抓取设备指纹。\n点右上「重新抓取」前请先用顶部「连接」连上 ESP32 桥。")
-        self.hw_text.configure(state="normal")
-        self.hw_text.delete("1.0", "end")
-        self.hw_text.insert("end", "（暂无 bridge_info.txt）")
-        self.hw_text.configure(state="disabled")
+            "尚未抓取设备指纹。\n点右上「重新抓取」前请先用顶部「连接」连上 ESP32 桥。\n"
+            "抓取时固件的原始回包会实时出现在「固件烧录」页的日志里。")
 
     # ---- 摘要区渲染：一行若干「字段 值 ?」，? 上挂 HW_TIPS ----
     def _hw_clear_rows(self):
         try:
             HoverTip.hide_all()
+            # 「板载灯」那一行是常驻控件：它带着用户填的 GPIO 和灯型，
+            # 每次刷新摘要都重建会把用户刚填的值冲掉，所以留着不删。
+            keep = getattr(self, "hw_led_row", None)
             for w in self.hw_grid.winfo_children():
+                if keep is not None and w is keep:
+                    continue
                 w.destroy()
         except Exception:
             pass
@@ -2202,10 +2497,15 @@ class App(tk.Tk):
             tk.Label(self.hw_grid, text=text, bg=PANEL, fg=TEXT_DIM, anchor="w",
                      justify="left", font=("Microsoft YaHei UI", zp(9)),
                      wraplength=zp(540)).grid(row=0, column=0, sticky="w")
+            # 提示态也保留板载灯那一行（没抓指纹时用户照样能配灯）
+            led = getattr(self, "hw_led_row", None)
+            if led is not None:
+                led.grid(row=1, column=0, columnspan=2, sticky="w",
+                         padx=(0, zp(6)), pady=zp(3))
         except Exception:
             pass
 
-    def _hw_set_rows(self, rows):
+    def _hw_set_rows(self, rows, led_after_label=None):
         """摘要区一律**单列**：每个字段占一行，横向只有「字段 / 值 / ?」三列。
 
         `rows` 仍是按语义分组传来（MAC+电量+连接 一组…），但这里顺序展平 ——
@@ -2215,8 +2515,18 @@ class App(tk.Tk):
 
         cell 可以是 3 元组 (字段, 值, 提示键)，也可以是 4 元组
         (字段, 值, 提示键, True) —— 第 4 位 True 表示值自身带换行、需要多行显示。
+
+        `led_after_label`：渲染到该字段那一行之后，把常驻的「板载灯」配置行
+        挂进同一个 grid（用户要求它显示在「电量」下方）。
         """
         self._hw_clear_rows()
+        led = getattr(self, "hw_led_row", None)
+        if led is not None:
+            try:
+                led.grid_forget()   # 先摘下来，避免行号变化后与别的行叠在一起
+            except Exception:
+                pass
+        led_placed = False
         try:
             r = 0
             for cells in rows:
@@ -2245,6 +2555,17 @@ class App(tk.Tk):
                     q.pack(side="left", anchor="n", padx=(zp(6), 0))
                     HoverTip(q, HW_TIPS.get(tip, ""))
                     r += 1
+                    if (led_after_label and not led_placed and label == led_after_label
+                            and led is not None):
+                        led.grid(row=r, column=0, columnspan=2,
+                                 sticky="w", padx=(0, zp(6)), pady=zp(3))
+                        led_placed = True
+                        r += 1
+            # 兜底：没有「电量」那一行（比如电池读不到）就挂在最下面，
+            # 绝不能让它停在旧行号上跟别的字段叠在一起。
+            if led is not None and not led_placed:
+                led.grid(row=r, column=0, columnspan=2,
+                         sticky="w", padx=(0, zp(6)), pady=zp(3))
         except Exception:
             pass
 
@@ -2266,6 +2587,12 @@ class App(tk.Tk):
             return None if v is None else (on if v else off)
 
         b = info.get("batt")
+        # 板载灯：把固件里存的值回填到控件（老固件不上报 OK LED，就保持默认 21 / WS2812）
+        if info.get("led_pin") is not None:
+            self.hw_led_pin.set(str(info["led_pin"]))
+        if info.get("led_type") is not None:
+            self.hw_led_type.set("普通LED" if info["led_type"] == 1 else "WS2812彩灯")
+
         push(cell("遥控器 MAC", info.get("mac"), "mac"),
              cell("电量", ("%d%%" % b) if (b is not None and b >= 0) else None, "batt"),
              cell("连接", flag(info.get("conn"), "已连接", "未连接"), "conn"))
@@ -2326,14 +2653,12 @@ class App(tk.Tk):
             push(cell("报告映射", "\n".join(lines), "role", True))
 
         if rows:
-            self._hw_set_rows(rows)
+            self._hw_set_rows(rows, led_after_label="电量")
         else:
-            self._hw_set_message("（未能解析指纹，见下方原始数据）")
-
-        self.hw_text.configure(state="normal")
-        self.hw_text.delete("1.0", "end")
-        self.hw_text.insert("end", text)
-        self.hw_text.configure(state="disabled")
+            # 原始指纹框已删，兜底提示改成指向页4 日志（那里有同一份回包原文）。
+            self._hw_set_message(
+                "（未能解析出指纹字段）\n"
+                "固件的原始回包可在「固件烧录」页的日志里查看，点「保存日志」可导出。")
 
     @staticmethod
     def parse_bridge_info(text):
@@ -2378,6 +2703,14 @@ class App(tk.Tk):
                 m = re.search(r"(\d+)", s)
                 if m:
                     d["scan"] = int(m.group(1))
+            elif s.startswith("OK LED "):
+                # 注意带空格：固件还有 "OK LEDTEST ..."，这里只认查询回包
+                m = re.search(r"pin=(\d+)", s)
+                if m:
+                    d["led_pin"] = int(m.group(1))
+                m = re.search(r"type=(\d+)", s)
+                if m:
+                    d["led_type"] = int(m.group(1))
             elif s.startswith("OK INFO"):
                 m = re.search(r"name=([^\s]+)", s)
                 if m:
@@ -2450,10 +2783,44 @@ class App(tk.Tk):
     def _hw_clear_display(self):
         try:
             self._hw_set_message("正在重新抓取设备指纹…")
-            self.hw_text.configure(state="normal")
-            self.hw_text.delete("1.0", "end")
-            self.hw_text.insert("end", "（抓取中，请稍候…）")
-            self.hw_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _hw_led_say(self, text, color=None):
+        try:
+            self.hw_led_msg.configure(text=text, fg=color or TEXT_DIM)
+        except Exception:
+            pass
+
+    def _hw_led_test(self):
+        """板载灯识别：把 GPIO + 灯型写进固件 NVS，并立刻亮 3 秒。
+
+        固件端 `LEDTEST <pin> <type>` 是"先保存再亮灯"。用户明确要求
+        「不论 GPIO 是否正确都刷入 ESP32 保存 NVS」，所以这里只挡非数字和
+        超出 0~48 的值，不判断那个脚上到底有没有灯 —— 那件事只能靠用户看。
+        """
+        if self.ser is None:
+            messagebox.showwarning("未连接", "先连接 ESP32 桥（顶部「连接」）再测试。")
+            return
+
+        raw = (self.hw_led_pin.get() or "").strip()
+        if not raw.isdigit():
+            messagebox.showwarning("GPIO 无效", "板载灯 GPIO 请填数字，例如 21 或 48。")
+            return
+        pin = int(raw)
+        if pin < 0 or pin > 48:
+            messagebox.showwarning("GPIO 超范围", "ESP32-S3 的 GPIO 编号范围是 0~48。")
+            return
+
+        is_led = self.hw_led_type.get().startswith("普通")
+        ltype = 1 if is_led else 0
+        if not self.send("LEDTEST %d %d" % (pin, ltype)):
+            return
+
+        kind = "普通LED（点亮）" if is_led else "WS2812（亮蓝）"
+        self._hw_led_say("已写入 GPIO %d / %s，亮 3 秒…" % (pin, kind), ACCENT)
+        try:
+            self.after(3500, lambda: self._hw_led_say(""))
         except Exception:
             pass
 
@@ -2468,7 +2835,7 @@ class App(tk.Tk):
         threading.Thread(target=self._hw_capture, daemon=True).start()
 
     def _hw_capture(self):
-        cmds = ["STAT", "TARGET", "INFO", "REPORTS", "MAPDUMP", "BATT", "SCANDUMP"]
+        cmds = ["STAT", "TARGET", "INFO", "REPORTS", "MAPDUMP", "BATT", "LED", "SCANDUMP"]
         self._cap = []
         self._cap_active = True
         try:
@@ -2492,6 +2859,165 @@ class App(tk.Tk):
         # 一律走 ui_q 由主线程的 _drain 执行。
         self.ui_q.put(lambda: self._hw_render(text))
 
+    # ------------------------------------------------- 重置连接（回到出厂态）--
+    # 一次点击做三件事，目标是「相当于新用户第一次使用」：
+    #   ① 删程序目录下三个本地记忆文件
+    #        bridge_info.txt   上次「重新抓取」落盘的硬件指纹（含 MAC / 电量等）
+    #        bridge_port.json  上次用的串口 + 芯片序列号记忆
+    #        remotekey.ini     学到的键位映射表
+    #   ② TARGET CLEAR  —— 清掉固件 NVS 里记住的遥控器地址（g_cfg.pin）
+    #   ③ REBOOT        —— 重启 ESP32
+    #
+    # 为什么必须重启（这一条是实测得出的，别再简化）：
+    #   固件的 TARGET CLEAR 只做 `g_cfg.pin[0]=0; saveCfg();`，**不会断开现有
+    #   BLE 链路**。pin 清了但链路还连着，遥控器按键照样在往前送，用户看到的是
+    #   「重置了但它还连着」。只有 ESP.restart() 才会真正断链；重启后 NVS 里
+    #   pin 已空，走的就是「扫到候选 → 逐个连上验证」的首次使用路径。
+    #
+    # 顺序按昊哥定的：删文件 → TARGET CLEAR → 重启。
+    RESET_FILES = ("bridge_info.txt", "bridge_port.json", "remotekey.ini")
+
+    def _hw_reset_conn(self):
+        base = app_dir()
+        exist = [os.path.join(base, n) for n in self.RESET_FILES
+                 if os.path.isfile(os.path.join(base, n))]
+        linked = self.ser is not None
+
+        # 既没文件可删、又没连串口（清不了固件侧）—— 无事可做，别弹确认框
+        if not exist and not linked:
+            messagebox.showinfo(
+                "重置连接",
+                "当前已经是初始状态，没有可重置的内容：\n\n"
+                + "\n".join("  " + n for n in self.RESET_FILES)
+                + "\n\n位置：\n" + base
+                + "\n\n要清固件记住的遥控器地址，请先连上 ESP32 桥再点这个按钮。")
+            return
+
+        # ---- 把要做的事一条条写清楚再让用户确认 ----
+        todo = []
+        if exist:
+            todo.append("· 删除本地文件（不可恢复）：\n    "
+                        + "\n    ".join(os.path.basename(p) for p in exist))
+        else:
+            todo.append("· 本地文件：已无（本来就是初始状态）")
+        if linked:
+            todo.append("· 清除固件记住的遥控器地址（TARGET CLEAR）")
+            todo.append("· 重启 ESP32 —— 会真正断开当前蓝牙连接")
+        else:
+            todo.append("· 固件侧：未连接串口，跳过（遥控器地址不会被清）")
+
+        if not messagebox.askyesno(
+                "重置连接",
+                "把连接状态恢复成「新用户第一次使用」：\n\n"
+                + "\n".join(todo)
+                + "\n\n本地文件位置：\n" + base
+                + ("\n\nESP32 重启需要两三秒，串口会断开，之后要重新点「连接」。"
+                   if linked else "") +
+                  "\n\n继续？"):
+            return
+
+        # ---- ① 删本地文件（同步、即时）----
+        ok, fail = [], []
+        for p in exist:
+            try:
+                os.remove(p)
+                ok.append(os.path.basename(p))
+            except Exception as exc:
+                fail.append("%s（%s）" % (os.path.basename(p), exc))
+        self._reset_ok, self._reset_fail = ok, fail
+        self._reset_fw = []          # 固件侧结果，异步填
+
+        # ---- ②③ 固件侧 ----
+        if not linked:
+            self._hw_reset_finish()
+            return
+        self._flash_print("\n=== 重置连接：TARGET CLEAR + REBOOT ===\n")
+        self.send("TARGET CLEAR")
+        # 等 OK TARGET cleared 再发 REBOOT：两条命令挤在一起时，重启有可能
+        # 把还没处理完的串口缓冲一起丢掉。最多等 2.5 秒，超时也照样重启
+        # （重启本身就能把 pin 空着的状态实装下来）。
+        self._reset_wait_for("OK TARGET cleared", 2500, self._reset_do_reboot)
+
+    def _reset_wait_for(self, prefix, timeout_ms, done, tick=60):
+        """等固件回一条以 prefix 开头的行，命中或超时后调 done(hit)。
+
+        不能用阻塞读：串口行由 _reader 线程塞进 rx_q、再由主线程 _drain 消费，
+        在主线程上 wait 会把消费链一起卡住，永远等不到那一行。
+        """
+        self._rx_watch = {"prefix": prefix, "hit": False}
+        t0 = time.time()
+
+        def poll():
+            w = getattr(self, "_rx_watch", None)
+            hit = bool(w and w.get("hit"))
+            if hit or (time.time() - t0) * 1000 >= timeout_ms:
+                self._rx_watch = None
+                try:
+                    done(hit)
+                except Exception:
+                    pass
+                return
+            self.after(tick, poll)
+
+        self.after(tick, poll)
+
+    def _reset_do_reboot(self, cleared):
+        self._reset_fw.append("TARGET CLEAR：" + ("已清除" if cleared else "未确认（可能未执行）"))
+        if self.ser is None:
+            self._hw_reset_finish()
+            return
+        self.send("REBOOT")
+        # 固件是 `OK REBOOT` → delay(200) → ESP.restart()。给 700ms 让它把回包
+        # 吐完并进入重启，再主动 close —— 手不放，重启过程中旧句柄会读出一堆
+        # 异常，日志难看且没意义。
+        self.after(700, self._hw_reset_finish)
+
+    def _hw_reset_finish(self):
+        ok = getattr(self, "_reset_ok", [])
+        fail = getattr(self, "_reset_fail", [])
+        fw = getattr(self, "_reset_fw", [])
+
+        # ESP32 已重启，USB CDC 会重新枚举，旧句柄必须关掉，否则界面还显示
+        # 「已连接」但什么都发不进去，用户会以为重置把板子搞坏了。
+        was_linked = self.ser is not None
+        if was_linked:
+            try:
+                self.close_port()
+            except Exception:
+                pass
+
+        if ok:
+            try:
+                self._hw_set_message("已重置连接（等同于新用户第一次使用）。\n"
+                                     "删除了：%s" % "、".join(ok))
+            except Exception:
+                pass
+
+        parts = []
+        if ok:
+            parts.append("已删除本地文件：\n" + "\n".join("  " + n for n in ok))
+        if fail:
+            parts.append("删除失败（可能正被占用）：\n" + "\n".join("  " + n for n in fail))
+        if fw:
+            parts.append("固件侧：\n" + "\n".join("  " + x for x in fw))
+        if was_linked:
+            parts.append("ESP32 已重启，串口已断开 —— 请重新点「连接」，"
+                         "然后按一下遥控器上的键，它会像新用户那样重新识别。")
+        parts.append("本程序内存里还留着旧指纹与键位映射，要彻底回到初始状态请重启本程序。")
+
+        # ESP32 重启会重新枚举 USB，下拉框里那个口可能已失效或换了号。
+        # 这里排一次重扫（放在 showinfo 之前注册：消息框是模态的，after 会等
+        # 用户点掉之后才跑，那时设备基本已经重新枚举完，正好是一次有效扫描）。
+        if was_linked:
+            self.after(2000, lambda: self.refresh_ports(force=True))
+
+        text = "\n\n".join(parts)
+        if fail:
+            messagebox.showwarning("重置连接", text)
+        else:
+            messagebox.showinfo("重置连接", text)
+
+
     # --------------------------------------------------- 页2：按键映射 ----
     def _page_keys(self):
         if self.pages[1] is not None:
@@ -2500,16 +3026,28 @@ class App(tk.Tk):
         self.pages[1] = f
         area = tk.Frame(f, bg=BG)
         area.pack(fill="both", expand=True, padx=0, pady=0)
+        # 提示行原来挤在底栏最右，按钮一多就被压得看不见。挪到按钮上方单独一行：
+        # canvas 高度相应减掉这一行，否则最下面那排数字键会被顶出可视区。
+        HINT_H = zp(18)
         self.canvas = tk.Canvas(area, bg=BG, highlightthickness=0,
-                                width=self._win_w(), height=self._win_h())
+                                width=self._win_w(), height=self._win_h() - HINT_H)
         self.canvas.pack()
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-1>", self._on_click)
         self._draw_background()
         self._layout()
 
+        hint = tk.Frame(f, bg=BG)
+        hint.pack(fill="x", padx=zp(14), pady=(zp(2), 0))
+        self.lbl_dirty = tk.Label(hint, text="", bg=BG, fg=TEXT_DIM, anchor="w",
+                                  font=("Microsoft YaHei UI", zp(9)))
+        self.lbl_dirty.pack(side="left", fill="x", expand=True)
+
         bar = tk.Frame(f, bg=BG)
-        bar.pack(fill="x", padx=zp(14), pady=(zp(8), zp(12)))
+        bar.pack(fill="x", padx=zp(14), pady=(zp(4), zp(10)))
+        # 方案切换已移到顶部栏（见 _build_shell），底栏只留操作按钮，
+        # 这样「学习遥控器按键」能完整显示。底部不能再加行：canvas 高度固定，
+        # 加行会把最下面那排数字键裁掉。
         self.btn_save = tk.Button(bar, text="保存到设备", command=self.cmd_save,
                                   bg=BTN, fg=BTN_FG, relief="flat", borderwidth=0,
                                   activebackground="#0f8b4c", activeforeground="#ffffff",
@@ -2525,9 +3063,288 @@ class App(tk.Tk):
                   activebackground=CARD_HOVER, activeforeground=WARN,
                   font=("Microsoft YaHei UI", zp(9))).pack(side="left",
                                                            ipadx=zp(6), ipady=zp(2))
-        self.lbl_dirty = tk.Label(bar, text="", bg=BG, fg=TEXT_DIM,
-                                  font=("Microsoft YaHei UI", zp(8)))
-        self.lbl_dirty.pack(side="right", padx=(zp(24), 0))
+        self.btn_learn = tk.Button(bar, text="学习遥控器按键", command=self.cmd_learn_toggle,
+                                   bg=BTN2, fg=TEXT, relief="flat", borderwidth=0,
+                                   activebackground=CARD_HOVER, activeforeground=TEXT,
+                                   font=("Microsoft YaHei UI", zp(9)))
+        self.btn_learn.pack(side="left", padx=(zp(8), 0), ipadx=zp(6), ipady=zp(2))
+        self._refresh_plan_menu()
+
+    # ------------------------------------------ 遥控器方案（一只遥控一套）--
+    def _refresh_plan_menu(self):
+        b = getattr(self, "btn_plan", None)
+        if b is None:
+            return
+        b.configure(text="方案：%s ▾" % self.cur_profile)
+        m = self.menu_plan
+        m.delete(0, "end")
+        for name in sorted(self.profiles):
+            m.add_command(label=(("✓ " if name == self.cur_profile else "   ") + name),
+                          command=lambda n=name: self.cmd_switch_plan(n))
+        m.add_separator()
+        m.add_command(label="新建方案（复制当前）…", command=self.cmd_new_plan)
+        m.add_command(label="重命名当前方案…", command=self.cmd_rename_plan)
+        m.add_command(label="删除当前方案", command=self.cmd_del_plan)
+
+    def _save_cur_kids(self):
+        self.profiles[self.cur_profile]["kids"] = dict(self.kidmap)
+        save_bindfile(self.profiles, self.cur_profile)
+
+    def _sync_cards_kidmap(self):
+        """方案换了一套 id：把每张卡片的 kid 同步过来，再整体重画。"""
+        for label, c in self.cards.items():
+            if c.get("na"):
+                continue
+            c["kid"] = self.kidmap.get(label, 0)
+        self._refresh_all()
+
+    def _push_kidmap(self):
+        """按当前方案的 id 把整表下发到设备（只写设备内存，不碰 ini、不落闪存）。
+
+        这里刻意不调 cmd_save：那个会顺手把 remotekey.ini 重写一遍，
+        而刚启动、ini 还没加载时那样会写出一张空表，把用户手改的映射清掉。
+        """
+        for label, _k, _x, _y in REMOTE:
+            kid = self.kidmap.get(label, 0)
+            if not kid:
+                continue
+            rec = self.ini.get(label)
+            if rec is None:
+                continue
+            ot, keys, n = rec
+            if n == 0:
+                self.send("SET %04X 1 0" % kid)
+            else:
+                self.send("SET %04X %d %d %s" % (
+                    kid, ot, n, " ".join("%02X" % keys[i] for i in range(n))))
+
+    def cmd_switch_plan(self, name):
+        if name == self.cur_profile or name not in self.profiles:
+            return
+        if self.changed and not messagebox.askokcancel(
+                "切换方案", "当前有 %d 处改动没保存，切换会丢掉。继续？" % len(self.changed)):
+            return
+        self._learn_end(silent=True)
+        self.cur_profile = name
+        self.kidmap = dict(self.profiles[name]["kids"])
+        self._save_cur_kids()
+        self.changed.clear()
+        self._sync_cards_kidmap()
+        self._refresh_plan_menu()
+        # 切换 = 立即下发：固件里只有一张表，不写进去等于没切。
+        # 没连接时只改界面，连上后点「保存到设备」补发。
+        if self.ser is not None:
+            self._push_kidmap()
+            self.ini_note = "已切到「%s」并写入设备（闪存另点保存）" % name
+        else:
+            self.ini_note = "已切到「%s」（未连接，尚未下发）" % name
+        self._mark_dirty()
+
+    def _ask_text(self, title, prompt, initial=""):
+        try:
+            from tkinter import simpledialog
+            return simpledialog.askstring(title, prompt, initialvalue=initial, parent=self)
+        except Exception:
+            return None
+
+    def cmd_new_plan(self):
+        name = self._ask_text("新建方案", "给这套键位起个名字（比如「三号遥控」）：",
+                              "方案%d" % (len(self.profiles) + 1))
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.profiles:
+            messagebox.showwarning("名字重复", "已经有叫「%s」的方案了。" % name)
+            return
+        self.profiles[name] = {"kids": dict(self.kidmap), "note": ""}
+        save_bindfile(self.profiles, self.cur_profile)
+        self.cmd_switch_plan(name)
+        self._refresh_plan_menu()
+
+    def cmd_rename_plan(self):
+        name = self._ask_text("重命名方案", "新的名字：", self.cur_profile)
+        if not name:
+            return
+        name = name.strip()
+        if not name or name == self.cur_profile:
+            return
+        if name in self.profiles:
+            messagebox.showwarning("名字重复", "已经有叫「%s」的方案了。" % name)
+            return
+        old = self.cur_profile
+        # 保持顺序：dict 重建时把原位置换掉
+        self.profiles = {(name if k == old else k): v for k, v in self.profiles.items()}
+        self.cur_profile = name
+        self._save_cur_kids()
+        self._refresh_plan_menu()
+        self.ini_note = "方案「%s」已改名为「%s」" % (old, name)
+        self._mark_dirty()
+
+    def cmd_del_plan(self):
+        if len(self.profiles) <= 1:
+            messagebox.showinfo("不能删除", "至少要留一套方案。")
+            return
+        if not messagebox.askokcancel("删除方案",
+                                      "删掉「%s」？这只遥控的键位记录会一起消失。"
+                                      % self.cur_profile):
+            return
+        self.profiles.pop(self.cur_profile, None)
+        self.cur_profile = sorted(self.profiles)[0]
+        self.kidmap = dict(self.profiles[self.cur_profile]["kids"])
+        save_bindfile(self.profiles, self.cur_profile)
+        self.changed.clear()
+        self._sync_cards_kidmap()
+        self._refresh_plan_menu()
+        self.ini_note = "已删除，当前方案「%s」" % self.cur_profile
+        self._mark_dirty()
+
+    # ------------------------------------------------- 学习遥控器按键 --
+    def _on_escape(self, _e=None):
+        """Esc 的三级含义：取消正在学的那个键 → 退出学习模式 → 关窗口。
+
+        以前 Esc 直接 destroy()，学习到一半误按一下整个程序就没了。
+        """
+        if self._learn_label:
+            self._learn_restore(self._learn_label)
+            self._learn_label = None
+            if self.ser is not None:
+                self.send("LEARN 0")
+            self.lbl_hint.configure(text="已取消这个键的学习", fg=TEXT_DIM)
+            return
+        if self._learn_on:
+            self._learn_end()
+            return
+        self._learn_end(silent=True)
+        self.destroy()
+
+    def cmd_learn_toggle(self):
+        if self._learn_on:
+            self._learn_end()
+            return
+        if self.ser is None:
+            messagebox.showwarning("未连接",
+                                   "学习要靠串口读设备收到的按键，先连上设备再学。")
+            return
+        self._learn_on = True
+        self.btn_learn.configure(text="结束学习", bg=ACCENT, fg="white")
+        # 底栏这一格很窄（右边还要放文件提示），只放短标记；
+        # 完整说明走顶部 lbl_hint，那里一行放得下。
+        self.lbl_dirty.configure(text="● 学习中", fg=ACCENT)
+        self.lbl_hint.configure(text="学习模式：点一张卡片，再按遥控器上对应的键")
+
+    def _learn_begin(self, label):
+        c = self.cards.get(label)
+        if c is None or c.get("na"):
+            return
+        if self._learn_label:
+            self._learn_restore(self._learn_label)
+        self._learn_label = label
+        self.send("LEARN 1")            # 固件：learning 时不输出按键，只打 # KEY
+        self.canvas.itemconfigure(c["value"], text="按键…", fill=ACCENT)
+        self.canvas.itemconfigure(c["rect"], outline=BORDER_HOT, width=2)
+        self.lbl_hint.configure(text="等待「%s」键…（Esc 取消这个键）" % label,
+                                fg=TEXT_DIM)
+        self._learn_arm_timeout()
+
+    def _learn_arm_timeout(self):
+        """等按键等太久就提醒一次。有些键（比如关机）在 BLE 上根本没有输出，
+        不给提示的话用户会以为是软件卡住了。"""
+        self._learn_disarm_timeout()
+        self._learn_timer = self.after(15000, self._learn_timeout)
+
+    def _learn_disarm_timeout(self):
+        t = getattr(self, "_learn_timer", None)
+        if t is not None:
+            try:
+                self.after_cancel(t)
+            except Exception:
+                pass
+            self._learn_timer = None
+
+    def _learn_timeout(self):
+        self._learn_timer = None
+        if not self._learn_label:
+            return
+        self.lbl_hint.configure(
+            text="15 秒没收到按键 —— 请再按一下；一直没反应说明这个键不发蓝牙信号",
+            fg=WARN)
+
+    def _learn_restore(self, label):
+        self._learn_disarm_timeout()
+        c = self.cards.get(label)
+        if c is None or c.get("na"):
+            return
+        self.canvas.itemconfigure(c["value"], text=self._card_value(label), fill=TEXT)
+        self._refresh_card(label)
+
+    def _learn_end(self, silent=False):
+        self._learn_disarm_timeout()
+        if self._learn_label:
+            self._learn_restore(self._learn_label)
+            self._learn_label = None
+        was = self._learn_on
+        self._learn_on = False
+        if self.ser is not None and was:
+            self.send("LEARN 0")
+        b = getattr(self, "btn_learn", None)
+        if b is not None:
+            b.configure(text="学习遥控器按键", bg=BTN2, fg=TEXT)
+        if not silent:
+            self.lbl_hint.configure(text="")
+            self._mark_dirty()
+
+    def _learn_finish(self, kid):
+        """收到遥控器按键：把它绑到当前等待的卡片上。"""
+        label = self._learn_label
+        if not label:
+            return
+        self._learn_label = None
+        self.send("LEARN 0")
+        old = self.kidmap.get(label, 0)
+
+        if kid == old:
+            self._learn_restore(label)
+            self.lbl_hint.configure(text="和原来一样（0x%04X），没改动" % kid, fg=TEXT_DIM)
+            return
+
+        # 同一个 id 只能绑一个动作（固件里 id 就是主键），先处理抢位
+        owner = next((l for l, k in self.kidmap.items() if k == kid and l != label), None)
+        if owner:
+            if not messagebox.askokcancel(
+                    "键位冲突",
+                    "0x%04X 现在绑在「%s」上。\n把它改绑给「%s」之后，「%s」会变成未绑定。"
+                    % (kid, owner, label, owner)):
+                self._learn_restore(label)
+                self.lbl_hint.configure(text="已取消", fg=TEXT_DIM)
+                return
+            self.kidmap[owner] = 0
+            oc = self.cards.get(owner)
+            if oc is not None:
+                oc["kid"] = 0
+            self.changed.add(owner)
+            self._refresh_card(owner)
+
+        self.kidmap[label] = kid
+        c = self.cards.get(label)
+        if c is not None:
+            c["kid"] = kid
+
+        # 替换语义：旧 id 没有任何卡片再用它了，就从设备表里删掉，别留垃圾
+        if old and old not in self.kidmap.values():
+            self.send("DEL %04X" % old)
+            self.bindings.pop(old, None)
+
+        # 新 id 立刻按这张卡当前的动作下发（固件里 SET 立即生效，闪存另点保存）
+        rec = self.ini.get(label) or (1, [0, 0, 0, 0], 0)
+        self._apply(label, rec[0], list(rec[1]), rec[2])
+
+        self._save_cur_kids()
+        self._learn_restore(label)
+        self.lbl_hint.configure(
+            text="「%s」已绑到 0x%04X —— 记得点「保存到设备」写进闪存" % (label, kid),
+            fg=TEXT_DIM)
 
     # --------------------------------------------------- 页3：语音方案 ----
     def _page_voice(self):
@@ -2709,6 +3526,29 @@ class App(tk.Tk):
                        bg=BG, fg=TEXT_DIM, selectcolor=PANEL, activebackground=BG,
                        font=("Microsoft YaHei UI", zp(9)), command=self._flash_toggle_wrap
                        ).pack(side="left")
+
+        # 串口命令：调试时最常用的是 TARGET（手工指定遥控器地址）和
+        # TARGET CLEAR（忘掉上次记住的那只）。没有这个入口的话，一旦扫不到
+        # 遥控器广播（地址报全 0），界面上就完全没法自救 —— 只能干等。
+        row4 = tk.Frame(ctl, bg=BG)
+        row4.pack(fill="x", pady=(0, zp(8)))
+        tk.Label(row4, text="串口命令", bg=BG, fg=TEXT_DIM,
+                 font=("Microsoft YaHei UI", zp(9))).pack(side="left")
+        self.cmd_entry = tk.Entry(row4, bg=PANEL, fg=TEXT, relief="flat",
+                                  font=("Consolas", zp(9)))
+        self.cmd_entry.pack(side="left", fill="x", expand=True, padx=zp(6), ipady=zp(3))
+        self.cmd_entry.bind("<Return>", lambda e: self._send_cmd())
+        tk.Button(row4, text="发送", command=self._send_cmd,
+                  bg=BTN2, fg=BTN2_FG, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=TEXT,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", ipadx=zp(6), ipady=zp(1))
+        tk.Button(row4, text="忘掉记住的地址",
+                  command=lambda: self._send_cmd("TARGET CLEAR"),
+                  bg=BTN2, fg=WARN, relief="flat", borderwidth=0,
+                  activebackground=CARD_HOVER, activeforeground=WARN,
+                  font=("Microsoft YaHei UI", zp(9))
+                  ).pack(side="left", padx=zp(6), ipadx=zp(6), ipady=zp(1))
 
         logf = tk.Frame(f, bg=BG, padx=zp(18))
         logf.pack(fill="both", expand=True, pady=(0, zp(14)))
@@ -3096,6 +3936,27 @@ class App(tk.Tk):
         self.flash_log.delete("1.0", "end")
         self.flash_log.configure(state="disabled")
         self._flash_n = 0
+
+    def _send_cmd(self, text=None):
+        """向固件发一条串口命令；text 为空时取输入框里的内容。
+
+        只写串口、不解析回包 —— 固件的 OK/ERR 会由串口读线程原样打到日志里。
+        """
+        if self.ser is None:
+            messagebox.showwarning("未连接", "先连接 ESP32 桥（顶部「连接」）。")
+            return
+        entry = getattr(self, "cmd_entry", None)
+        cmd = text if text else (entry.get().strip() if entry is not None else "")
+        if not cmd:
+            return
+        try:
+            self.ser.write((cmd + "\n").encode())
+        except Exception as ex:
+            messagebox.showerror("发送失败", str(ex))
+            return
+        self._flash_print(">>> %s\n" % cmd)
+        if text is None and entry is not None:
+            entry.delete(0, "end")
 
     def _flash_save(self):
         p = filedialog.asksaveasfilename(
@@ -3678,12 +4539,13 @@ class App(tk.Tk):
 
         items = []
         pushed = 0
-        for label, kid, _, _ in REMOTE:
+        for label, kid0, _, _ in REMOTE:
             r = table.get(label)
             if r is None:
                 continue
             ot, keys, n = r
             items.append((label, ot, keys, n))
+            kid = self.kidmap.get(label, 0)
             if not kid:              # TV 是红外键，只记 ini，不下发
                 continue
             pushed += 1
@@ -3818,7 +4680,7 @@ class App(tk.Tk):
 
     def _make_card(self, label, kid, kx, ky, cx, cy, side):
         """一个键：锚点 + 引线 + 文本框。锚点落在键的一侧，线不压住键本身。"""
-        na = (kid == 0)
+        na = (kid == 0)              # TV 键是红外直发，恒为不可学、不可绑
         ax = kx + side * zp(17)
         dot = self.canvas.create_oval(ax - zp(2.5), ky - zp(2.5), ax + zp(2.5), ky + zp(2.5),
                                       fill=(LEAD if not na else BORDER_NA), outline="")
@@ -3839,9 +4701,12 @@ class App(tk.Tk):
         val = self.canvas.create_text(x2 - zp(9), cy, text=("红外键" if na else "—"), anchor="e",
                                       fill=(TEXT if not na else BORDER_NA),
                                       font=("Microsoft YaHei UI", zp(10), "bold"))
-        self.cards[kid if kid else ("na", label)] = dict(
+        # 卡片一律按**名字**索引：id 现在是可学习的，用它当键的话，学完一次
+        # 整个 cards 字典的键就错位了（旧代码就是这么写的）。
+        self.cards[label] = dict(
             rect=rect, name=name, value=val, line=line, dot=dot,
-            kid=kid, label=label, x1=x1, y1=y1, x2=x2, y2=y2, na=na,
+            kid=(self.kidmap.get(label, kid) if kid else 0),
+            label=label, x1=x1, y1=y1, x2=x2, y2=y2, na=na,
             lock=False)
 
     # --------------------------------------------------------- 悬停/点击 --
@@ -3891,8 +4756,14 @@ class App(tk.Tk):
                 text="语音直出已开启，麦克风键已锁定；取消勾选后恢复原绑定")
             return
         kid = c["kid"]
-        Recorder(self, "改键：%s" % c["label"], self.bindings.get(kid), 
-                 lambda t, ks, n: self._apply(kid, t, ks, n))
+        label = c["label"]
+        # 学习模式下点卡片 = 「我要教程序：遥控器上这个键对应这张卡」，
+        # 不再进改键小窗。区别于原来直接弹 Recorder 的行为。
+        if self._learn_on:
+            self._learn_begin(label)
+            return
+        Recorder(self, "改键：%s" % label, self.bindings.get(kid),
+                 lambda t, ks, n: self._apply(label, t, ks, n))
 
     def _paint(self, k, hot):
         c = self.cards[k]
@@ -3902,8 +4773,8 @@ class App(tk.Tk):
             self._paint_lock(c)
             return
         self.canvas.itemconfigure(c["rect"], fill=(CARD_HOVER if hot else CARD),
-                                  outline=(BORDER_HOT if (hot or c["kid"] in self.changed) else BORDER),
-                                  width=(2 if (hot or c["kid"] in self.changed) else 1))
+                                  outline=(BORDER_HOT if (hot or c["label"] in self.changed) else BORDER),
+                                  width=(2 if (hot or c["label"] in self.changed) else 1))
         self.canvas.itemconfigure(c["line"], fill=(LEAD_HOT if hot else LEAD))
 
     def _paint_lock(self, c):
@@ -3928,7 +4799,7 @@ class App(tk.Tk):
 
     def _sync_asr_lock(self):
         """语音直出开着 -> 锁死麦克风键；关掉 -> 还原原绑定功能。"""
-        c = self.cards.get(MIC_KID)
+        c = self.cards.get("麦克风")
         if not c:
             return
         c["lock"] = bool(self.asr_on)
@@ -3936,9 +4807,9 @@ class App(tk.Tk):
             self._paint_lock(c)
         else:
             self._paint_unlock(c)
-        self._refresh_card(MIC_KID)
+        self._refresh_card("麦克风")
         # 鼠标正停在这块上时，光标也要跟着变
-        if self.hover == MIC_KID:
+        if self.hover == "麦克风":
             self.canvas.configure(cursor=("arrow" if c["lock"] else "hand2"))
 
     # ------------------------------------------------------------- 串口 --
@@ -4185,6 +5056,13 @@ class App(tk.Tk):
         self.after(300, self._hw_refresh)
 
     def close_port(self):
+        # 断开前先退出学习模式：固件里的 g_learnMode 不会自己复位，
+        # 留着它下次一连上，遥控器还是"只上报、不动作"。
+        if getattr(self, "_learn_on", False) or getattr(self, "_learn_label", None):
+            try:
+                self._learn_end(silent=True)
+            except Exception:
+                pass
         try:
             if self.ser:
                 self.ser.close()
@@ -4252,6 +5130,21 @@ class App(tk.Tk):
         # 调试日志：串口收到的每一行都带时间戳镜像到页4，按键报告 R / OK STAT
         # 这些原本解析完就丢了，页4 看不到任何实时输出。
         self._flash_rx(line)
+        # 「重置连接」在等某条回包（见 _reset_wait_for）。放在所有 return 之前，
+        # 否则会被下面的分支提前吃掉。
+        w = getattr(self, "_rx_watch", None)
+        if w is not None and not w.get("hit") and line.startswith(w["prefix"]):
+            w["hit"] = True
+        if line.startswith("# KEY "):
+            # 学习遥控器按键时固件打这行：`# KEY 20EB DOWN src=cons usage=0x0EB map=NONE`
+            # 只要按下那一半，抬起不管。注意它出现在 `#` 通用过滤之前。
+            # 用正则而不是 split：split 之后 [0] 是 '#'、[1] 是 'KEY'，
+            # 按下标取值极易错位一位（这里就错过一次，学习永远收不到键）。
+            if self._learn_label:
+                m = re.match(r"# KEY ([0-9A-Fa-f]{1,4})\s+DOWN", line)
+                if m:
+                    self._learn_finish(int(m.group(1), 16))
+            return
         if line.startswith("#"):
             return
         if line.startswith("B "):
@@ -4286,18 +5179,21 @@ class App(tk.Tk):
         if c.get("lock"):
             self._paint_lock(c)
             return
-        hot = c["kid"] in self.changed
+        hot = c["label"] in self.changed
         self.canvas.itemconfigure(c["rect"],
                                   outline=(BORDER_HOT if hot else BORDER),
                                   width=(2 if hot else 1))
 
     # ------------------------------------------------------------- 动作 --
-    def _apply(self, kid, out_type, keys, n):
-        """改一个键：更新 ini（内存）+ 立即下发到设备（闪存要另外点保存）"""
-        c = self.cards.get(kid)
-        label = c["label"] if c else None
-        if label:
-            self.ini[label] = (out_type, keys, n)
+    def _apply(self, label, out_type, keys, n):
+        """改一张卡的动作：更新 ini（内存）+ 立即下发到设备（闪存要另外点「保存到设备」）"""
+        self.ini[label] = (out_type, keys, n)
+        kid = self.kidmap.get(label, 0)
+        if not kid:                  # 红外键/没学到 id 的卡：只记本地
+            self.changed.add(label)
+            self._refresh_card(label)
+            self._mark_dirty()
+            return
         if n == 0:
             ok = self.send("SET %04X 1 0" % kid)
         else:
@@ -4306,8 +5202,8 @@ class App(tk.Tk):
         if not ok:
             return
         self.bindings[kid] = {"out_type": out_type, "keys": keys, "n": n}
-        self.changed.add(kid)
-        self._refresh_card(kid)
+        self.changed.add(label)
+        self._refresh_card(label)
         self._mark_dirty()
 
     def _mark_dirty(self):
@@ -4330,10 +5226,10 @@ class App(tk.Tk):
         """设备把整张表报完了"""
         force = getattr(self, "_force_list", False)
         added = over = 0
-        for label, kid, _, _ in REMOTE:
-            if not kid:
+        for label, kid0, _, _ in REMOTE:
+            if not kid0:
                 continue
-            b = self.bindings.get(kid)
+            b = self.bindings.get(self.kidmap.get(label, 0))
             if b is None:
                 continue
             if label in self.ini and not force:
@@ -4341,7 +5237,7 @@ class App(tk.Tk):
             self.ini[label] = (b["out_type"], b["keys"], b["n"])
             if force:
                 over += 1
-                self.changed.add(kid)
+                self.changed.add(label)
             else:
                 added += 1
         self._refresh_all()
@@ -4358,13 +5254,17 @@ class App(tk.Tk):
         if self.ser is None:
             messagebox.showwarning("未连接", "先连接设备，保存要把配置写进遥控器桥。")
             return
+        # 学习模式开着的话先收尾：固件在 learning 下不输出按键，
+        # 这时候保存完就撒手，遥控器会一直按了没反应。
+        self._learn_end(silent=True)
         items = []
-        for label, kid, _, _ in REMOTE:
+        for label, kid0, _, _ in REMOTE:
             r = self.ini.get(label)
             if r is None:
                 continue
             ot, keys, n = r
             items.append((label, ot, keys, n))
+            kid = self.kidmap.get(label, 0)
             if not kid:          # TV 是红外键，写进 ini 备查但不下发
                 continue
             if n == 0:
